@@ -1,0 +1,679 @@
+from __future__ import annotations
+
+import json
+
+from fastapi import APIRouter, FastAPI, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.responses import FileResponse
+
+from .ai import (
+    analyze_image_with_vision,
+    analyze_images_with_ocr,
+    cancel_react_gateway_run,
+    create_react_gateway_run,
+    create_react_session,
+    get_conversation_react_gateway_run,
+    get_react_session_trace,
+    list_conversation_react_traces,
+    list_models,
+    prepare_chat_request,
+    run_chat,
+    run_completion,
+    stream_react_gateway_run_events,
+    stream_react_session,
+    test_vision_model,
+)
+from .config import DIST_DIR, get_provider, public_config, read_config, write_config
+from .conversations import (
+    append_messages,
+    create_conversation,
+    delete_conversation,
+    list_conversations,
+    read_conversation,
+)
+from .documents import delete_document, list_documents, read_document_path, save_document
+from .documents import get_document_settings, update_document_settings
+from .doc_sessions import (
+    create_document_session,
+    execute_document_tool,
+    read_active_document_session,
+    read_document_session,
+    set_active_document_session,
+    subscribe_document_events,
+    update_document_session_from_client,
+)
+from .agents import cancel_agent_run, list_agent_definitions, list_agent_runs, read_agent_run
+from .models import (
+    AppendMessagesRequest,
+    ChatRequest,
+    CompletionRequest,
+    DocumentSessionActiveRequest,
+    DocumentSettingsUpdateRequest,
+    DocumentSessionCreateRequest,
+    DocumentSessionPatchRequest,
+    DocumentToolExecuteRequest,
+    ModelDiscoveryRequest,
+    PlanQuestionAnswerRequest,
+    PlanRejectRequest,
+    SettingsUpdate,
+    SkillCreateRequest,
+    SkillUpdateRequest,
+    TaskCreateRequest,
+    TaskUpdateRequest,
+    TemplateAnalyzeRequest,
+    TemplateCreateRequest,
+    TemplateUpdateRequest,
+    VisionAnalyzeRequest,
+    VisionTestRequest,
+    WorkspaceCreateRequest,
+    WorkspaceMoveRequest,
+    WorkspaceOpenRequest,
+)
+from .models import OCRCommandRequest
+from .template_analysis import analyze_template_request
+from .templates import create_template, delete_template, list_templates, read_template, update_template
+from .tasks import create_task, delete_task, get_task, list_tasks, reset_completed_tasks, update_task
+from .plans import answer_plan_question, approve_plan, get_plan, reject_plan
+from .skills import create_skill, delete_skill, list_skills, read_skill, update_skill
+from .workspace import (
+    create_folder,
+    create_workspace,
+    delete_file as ws_delete_file,
+    delete_memory_file as ws_delete_memory_file,
+    delete_workspace,
+    get_document_content as ws_get_content,
+    get_workspace_memory,
+    get_workspace_tree,
+    list_workspaces,
+    move_memory_file as ws_move_memory_file,
+    move_file as ws_move_file,
+    open_file_as_document,
+    read_memory_file as ws_read_memory_file,
+    read_file_path as ws_read_file_path,
+    save_memory_file as ws_save_memory_file,
+    save_file as ws_save_file,
+    search_workspace,
+    set_active_workspace,
+    upload_workspace_file,
+)
+from .ai_writer_bridge import attach_user_context, authenticate_request
+
+
+def sse(event_type: str, data: dict) -> str:
+    payload = {"type": event_type, **data}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def apply_no_store_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    for header_name in ("ETag", "Last-Modified"):
+        if header_name in response.headers:
+            del response.headers[header_name]
+    return response
+
+
+class AppStaticFiles(StaticFiles):
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        path = ""
+        if len(args) >= 3 and isinstance(args[2], dict):
+            path = str(args[2].get("path", "") or "")
+
+        if path.endswith(".js") or path.endswith(".css"):
+            return apply_no_store_headers(response)
+        else:
+            response.headers["Cache-Control"] = "public, max-age=86400"
+
+        return response
+
+
+def create_api_router() -> APIRouter:
+    router = APIRouter(prefix="/api")
+
+    @router.get("/health")
+    def health():
+        return {"status": "ok", "service": "openwps-backend"}
+
+    @router.get("/ai/settings")
+    def get_settings():
+        return public_config()
+
+    @router.put("/ai/settings")
+    def update_settings(body: SettingsUpdate):
+        current = read_config()
+        existing_by_id = {
+            str(provider.get("id")): provider
+            for provider in current.get("providers", [])
+            if isinstance(provider, dict)
+        }
+        existing_ocr = dict(current.get("ocrConfig") or {})
+        existing_vision = dict(current.get("visionConfig") or {})
+        cfg = {
+            "version": 2,
+            "activeProviderId": body.activeProviderId,
+            "imageProcessingMode": body.imageProcessingMode,
+            "ocrConfig": {},
+            "visionConfig": {},
+            "tavilyConfig": {},
+            "providers": [],
+        }
+        for provider in body.providers:
+            item = provider.model_dump(exclude_none=True)
+            if "apiKey" not in item and item.get("id") in existing_by_id:
+                item["apiKey"] = existing_by_id[item["id"]].get("apiKey", "")
+            cfg["providers"].append(item)
+
+        ocr_item = body.ocrConfig.model_dump(exclude_none=True)
+        ocr_item.pop("hasApiKey", None)
+        if "apiKey" not in ocr_item:
+            ocr_item["apiKey"] = existing_ocr.get("apiKey", "")
+        cfg["ocrConfig"] = ocr_item
+
+        vision_item = body.visionConfig.model_dump(exclude_none=True)
+        vision_item.pop("hasApiKey", None)
+        if "apiKey" not in vision_item:
+            vision_item["apiKey"] = existing_vision.get("apiKey", "")
+        cfg["visionConfig"] = vision_item
+
+        existing_tavily = dict(current.get("tavilyConfig") or {})
+        tavily_item = body.tavilyConfig.model_dump(exclude_none=True)
+        tavily_item.pop("hasApiKey", None)
+        if "apiKey" not in tavily_item:
+            tavily_item["apiKey"] = existing_tavily.get("apiKey", "")
+        cfg["tavilyConfig"] = tavily_item
+        write_config(cfg)
+        return public_config(cfg)
+
+    @router.get("/ai/models")
+    async def get_models(providerId: str | None = None):
+        cfg = read_config()
+        provider = get_provider(cfg, providerId)
+        models = await list_models(provider.get("endpoint", ""), str(provider.get("apiKey", "") or ""), provider.get("id"))
+        return {
+            "providerId": provider["id"],
+            "models": models,
+            "defaultModel": provider.get("defaultModel", ""),
+        }
+
+    @router.post("/ai/models/discover")
+    async def discover_models(body: ModelDiscoveryRequest):
+        if body.providerId:
+            provider = get_provider(read_config(), body.providerId)
+            endpoint = body.endpoint or provider.get("endpoint", "")
+            api_key = body.apiKey if body.apiKey is not None else str(provider.get("apiKey", "") or "")
+        else:
+            endpoint = body.endpoint or ""
+            api_key = body.apiKey or ""
+
+        models = await list_models(endpoint, api_key, body.providerId)
+        return {"models": models}
+
+    @router.post("/ai/vision/test")
+    async def post_vision_test(body: VisionTestRequest):
+        return await test_vision_model(body)
+
+    @router.post("/ai/vision/analyze")
+    async def post_vision_analyze(body: VisionAnalyzeRequest):
+        return await analyze_image_with_vision(body)
+
+    @router.get("/ai/agents")
+    def get_agents():
+        return {"agents": [agent.to_public_dict() for agent in list_agent_definitions()]}
+
+    @router.get("/conversations")
+    def get_conversations():
+        return list_conversations()
+
+    @router.post("/conversations")
+    def post_conversation(body: dict | None = None):
+        title = str((body or {}).get("title", "新会话"))
+        conv = create_conversation(title)
+        return {"id": conv["id"]}
+
+    @router.get("/conversations/{conv_id}")
+    def get_conversation(conv_id: str):
+        return read_conversation(conv_id)
+
+    @router.get("/conversations/{conv_id}/react-traces")
+    def get_conversation_react_traces(conv_id: str):
+        return {"traces": list_conversation_react_traces(conv_id)}
+
+    @router.get("/conversations/{conv_id}/runs/active")
+    def get_conversation_active_run(conv_id: str):
+        return {"run": get_conversation_react_gateway_run(conv_id)}
+
+    @router.post("/conversations/{conv_id}/messages")
+    def post_messages(conv_id: str, body: AppendMessagesRequest):
+        append_messages(
+            conv_id,
+            [message.model_dump(exclude_none=True) for message in body.messages],
+        )
+        return {"success": True}
+
+    @router.get("/conversations/{conv_id}/tasks")
+    def get_conversation_tasks(conv_id: str):
+        return {"tasks": list_tasks(conv_id)}
+
+    @router.get("/conversations/{conv_id}/plan")
+    def get_conversation_plan(conv_id: str):
+        return {"plan": get_plan(conv_id)}
+
+    @router.post("/conversations/{conv_id}/plan/approve")
+    def post_conversation_plan_approve(conv_id: str):
+        return {"plan": approve_plan(conv_id)}
+
+    @router.post("/conversations/{conv_id}/plan/reject")
+    def post_conversation_plan_reject(conv_id: str, body: PlanRejectRequest | None = None):
+        return {"plan": reject_plan(conv_id, body.feedback if body else "")}
+
+    @router.post("/conversations/{conv_id}/plan/questions/{question_id}/answer")
+    def post_conversation_plan_question_answer(conv_id: str, question_id: str, body: PlanQuestionAnswerRequest):
+        return {"plan": answer_plan_question(conv_id, question_id, body.answer)}
+
+    @router.get("/conversations/{conv_id}/agents")
+    def get_conversation_agents(conv_id: str):
+        return {"agents": list_agent_runs(conv_id)}
+
+    @router.get("/conversations/{conv_id}/agents/{agent_id}")
+    def get_conversation_agent(conv_id: str, agent_id: str):
+        return {"agent": read_agent_run(conv_id, agent_id)}
+
+    @router.post("/conversations/{conv_id}/agents/{agent_id}/cancel")
+    def post_cancel_conversation_agent(conv_id: str, agent_id: str):
+        return {"agent": cancel_agent_run(conv_id, agent_id)}
+
+    @router.post("/conversations/{conv_id}/tasks")
+    def post_conversation_task(conv_id: str, body: TaskCreateRequest):
+        return {"task": create_task(conv_id, body.model_dump(exclude_none=True))}
+
+    @router.post("/conversations/{conv_id}/tasks/reset-completed")
+    def post_reset_completed_tasks(conv_id: str):
+        return reset_completed_tasks(conv_id)
+
+    @router.get("/conversations/{conv_id}/tasks/{task_id}")
+    def get_conversation_task(conv_id: str, task_id: str):
+        return {"task": get_task(conv_id, task_id)}
+
+    @router.patch("/conversations/{conv_id}/tasks/{task_id}")
+    def patch_conversation_task(conv_id: str, task_id: str, body: TaskUpdateRequest):
+        return {"task": update_task(conv_id, task_id, body.model_dump(exclude_unset=True))}
+
+    @router.delete("/conversations/{conv_id}/tasks/{task_id}")
+    def delete_conversation_task(conv_id: str, task_id: str):
+        return delete_task(conv_id, task_id)
+
+    @router.delete("/conversations/{conv_id}")
+    def remove_conversation(conv_id: str):
+        delete_conversation(conv_id)
+        return {"success": True}
+
+    @router.get("/documents")
+    def get_documents(source: str | None = None):
+        return list_documents(source)
+
+    @router.get("/documents/settings")
+    def get_documents_settings():
+        return get_document_settings()
+
+    @router.put("/documents/settings")
+    def put_documents_settings(body: DocumentSettingsUpdateRequest):
+        return update_document_settings(body.model_dump(exclude_unset=True))
+
+    @router.post("/doc-sessions")
+    async def post_doc_session(body: DocumentSessionCreateRequest):
+        return await create_document_session(body.model_dump(exclude_none=True))
+
+    @router.get("/doc-sessions/active")
+    async def get_active_doc_session():
+        return await read_active_document_session()
+
+    @router.get("/doc-sessions/{session_id}")
+    async def get_doc_session(session_id: str):
+        return await read_document_session(session_id)
+
+    @router.post("/doc-sessions/{session_id}/active")
+    async def post_active_doc_session(session_id: str, body: DocumentSessionActiveRequest):
+        return await set_active_document_session(session_id, body.model_dump(exclude_none=True))
+
+    @router.post("/doc-sessions/{session_id}/client-patches")
+    async def post_doc_session_patch(session_id: str, body: DocumentSessionPatchRequest):
+        return await update_document_session_from_client(session_id, body.model_dump(exclude_unset=True))
+
+    @router.post("/doc-sessions/{session_id}/tools")
+    async def post_doc_session_tool(session_id: str, body: DocumentToolExecuteRequest):
+        return await execute_document_tool(
+            session_id,
+            body.toolName,
+            body.params,
+            base_version=body.baseVersion,
+            selection_context=body.selectionContext,
+        )
+
+    @router.get("/doc-sessions/{session_id}/events")
+    async def get_doc_session_events(session_id: str):
+        async def generate():
+            try:
+                async for event in subscribe_document_events(session_id):
+                    yield sse(str(event.get("type") or "document_event"), event)
+            except HTTPException as exc:
+                yield sse("error", {"message": exc.detail})
+            except Exception as exc:
+                yield sse("error", {"message": str(exc)})
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @router.put("/documents/{name:path}")
+    async def put_document(name: str, request: Request, source: str | None = None):
+        content = await request.body()
+        return save_document(name, content, source)
+
+    @router.get("/documents/{name:path}")
+    def get_document(name: str, source: str | None = None):
+        path = read_document_path(name, source)
+        return FileResponse(
+            path,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename=path.name,
+        )
+
+    @router.delete("/documents/{name:path}")
+    def remove_document(name: str, source: str | None = None):
+        delete_document(name, source)
+        return {"success": True}
+
+    @router.get("/templates")
+    def get_templates():
+        return list_templates()
+
+    @router.post("/templates")
+    def post_template(body: TemplateCreateRequest):
+        return create_template(body.model_dump(exclude_none=True))
+
+    @router.post("/templates/analyze")
+    async def analyze_template(body: TemplateAnalyzeRequest):
+        return await analyze_template_request(body.model_dump(exclude_none=True))
+
+    @router.get("/templates/{template_id}")
+    def get_template(template_id: str):
+        return read_template(template_id)
+
+    @router.patch("/templates/{template_id}")
+    def patch_template(template_id: str, body: TemplateUpdateRequest):
+        return update_template(template_id, body.model_dump(exclude_none=True))
+
+    @router.delete("/templates/{template_id}")
+    def remove_template(template_id: str):
+        delete_template(template_id)
+        return {"success": True}
+
+    # ── Skills (OpenWPS 原生技能) ──
+
+    @router.get("/skills")
+    def get_skills(workspaceId: str | None = None, scope: str = "all"):
+        return list_skills(workspace_id=workspaceId, scope=scope)
+
+    @router.post("/skills")
+    def post_skill(body: SkillCreateRequest):
+        return create_skill(body.model_dump(exclude_none=True))
+
+    @router.get("/skills/{skill_id}")
+    def get_skill(skill_id: str):
+        return read_skill(skill_id)
+
+    @router.patch("/skills/{skill_id}")
+    def patch_skill(skill_id: str, body: SkillUpdateRequest):
+        return update_skill(skill_id, body.model_dump(exclude_none=True))
+
+    @router.delete("/skills/{skill_id}")
+    def remove_skill(skill_id: str):
+        return delete_skill(skill_id)
+
+    # ── Workspaces (目录化工作区) ──
+
+    @router.get("/workspaces")
+    def get_workspaces():
+        return list_workspaces()
+
+    @router.post("/workspaces")
+    def post_workspace(body: WorkspaceCreateRequest):
+        return create_workspace(body.name, body.id)
+
+    @router.delete("/workspaces/{workspace_id}")
+    def remove_workspace(workspace_id: str):
+        return delete_workspace(workspace_id)
+
+    @router.post("/workspaces/{workspace_id}/active")
+    def post_active_workspace(workspace_id: str):
+        return set_active_workspace(workspace_id)
+
+    @router.get("/workspaces/{workspace_id}/tree")
+    def get_workspace_file_tree(workspace_id: str):
+        return get_workspace_tree(workspace_id)
+
+    @router.get("/workspaces/{workspace_id}/search")
+    def search_workspace_route(
+        workspace_id: str,
+        q: str,
+        doc_id: str | None = None,
+        context_lines: int = 3,
+        scope: str = "all",
+        path: str | None = None,
+    ):
+        return search_workspace(q, doc_id, context_lines, workspace_id=workspace_id, scope=scope, path=path)
+
+    @router.get("/workspaces/{workspace_id}/memory")
+    def get_workspace_memory_route(workspace_id: str, q: str | None = None):
+        return get_workspace_memory(workspace_id, query=q)
+
+    @router.get("/workspaces/{workspace_id}/memory/files/{path:path}")
+    def get_workspace_memory_file(workspace_id: str, path: str):
+        return ws_read_memory_file(workspace_id, path)
+
+    @router.put("/workspaces/{workspace_id}/memory/files/{path:path}")
+    async def put_workspace_memory_file(workspace_id: str, path: str, request: Request):
+        content = await request.body()
+        return ws_save_memory_file(workspace_id, path, content)
+
+    @router.delete("/workspaces/{workspace_id}/memory/files/{path:path}")
+    def delete_workspace_memory_file(workspace_id: str, path: str):
+        return ws_delete_memory_file(workspace_id, path)
+
+    @router.post("/workspaces/{workspace_id}/memory/files/{path:path}/move")
+    def move_workspace_memory_file(workspace_id: str, path: str, body: WorkspaceMoveRequest):
+        return ws_move_memory_file(workspace_id, path, body.toPath)
+
+    @router.post("/workspaces/{workspace_id}/folders/{path:path}")
+    def post_workspace_folder(workspace_id: str, path: str):
+        return create_folder(workspace_id, path)
+
+    @router.post("/workspaces/{workspace_id}/files/upload")
+    async def upload_workspace_file_route(workspace_id: str, file: UploadFile, path: str | None = None):
+        content = await file.read()
+        return upload_workspace_file(workspace_id, path, file.filename or "untitled", file.content_type or "", content)
+
+    @router.post("/workspaces/{workspace_id}/open")
+    async def post_workspace_open(workspace_id: str, body: WorkspaceOpenRequest):
+        payload = open_file_as_document(workspace_id, body.path)
+        session = await create_document_session(payload)
+        await set_active_document_session(
+            session["documentSessionId"],
+            {
+                "currentDocumentName": payload.get("currentDocumentName"),
+                "workspaceId": payload.get("workspaceId"),
+                "filePath": payload.get("filePath"),
+                "fileType": payload.get("fileType"),
+            },
+        )
+        return {**payload, **session}
+
+    @router.post("/workspaces/{workspace_id}/files/{path:path}/move")
+    def move_workspace_file_route(workspace_id: str, path: str, body: WorkspaceMoveRequest):
+        return ws_move_file(workspace_id, path, body.toPath)
+
+    @router.get("/workspaces/{workspace_id}/files/{path:path}/content")
+    def get_workspace_file_content(workspace_id: str, path: str, from_line: int | None = None, to_line: int | None = None):
+        return ws_get_content(path, from_line, to_line, workspace_id=workspace_id)
+
+    @router.get("/workspaces/{workspace_id}/files/{path:path}")
+    def get_workspace_file(workspace_id: str, path: str):
+        file_path = ws_read_file_path(workspace_id, path)
+        return FileResponse(file_path, filename=file_path.name)
+
+    @router.put("/workspaces/{workspace_id}/files/{path:path}")
+    async def put_workspace_file(workspace_id: str, path: str, request: Request):
+        content = await request.body()
+        return ws_save_file(workspace_id, path, content, content_type=request.headers.get("content-type", ""))
+
+    @router.delete("/workspaces/{workspace_id}/files/{path:path}")
+    def delete_workspace_file(workspace_id: str, path: str):
+        return ws_delete_file(workspace_id, path)
+
+    @router.post("/ai/chat")
+    async def chat(body: ChatRequest, request: Request):
+        return await run_chat(attach_user_context(body, request))
+
+    @router.post("/ai/complete")
+    async def complete(body: CompletionRequest):
+        return await run_completion(body)
+
+    @router.post("/ai/ocr")
+    async def analyze_ocr(body: OCRCommandRequest, request: Request):
+        attach_user_context(body, request)
+        return await analyze_images_with_ocr(body)
+
+    @router.post("/ai/react/stream")
+    async def react_stream(body: ChatRequest, request: Request):
+        prepared_body = await prepare_chat_request(attach_user_context(body, request))
+        session = create_react_session(prepared_body)
+
+        async def generate():
+            try:
+                async for event in stream_react_session(session):
+                    yield sse(str(event["type"]), event)
+            except HTTPException as exc:
+                yield sse("error", {"message": exc.detail})
+            except Exception as exc:
+                yield sse("error", {"message": str(exc)})
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @router.post("/ai/react/runs")
+    async def post_react_run(body: ChatRequest, request: Request):
+        prepared_body = await prepare_chat_request(attach_user_context(body, request))
+        run = await create_react_gateway_run(prepared_body)
+        return run.snapshot()
+
+    @router.get("/ai/react/runs/{session_id}/events")
+    async def get_react_run_events(session_id: str, after: int = 0):
+        async def generate():
+            try:
+                async for event in stream_react_gateway_run_events(session_id, after=after):
+                    yield sse(str(event["type"]), event)
+            except HTTPException as exc:
+                yield sse("error", {"message": exc.detail})
+            except Exception as exc:
+                yield sse("error", {"message": str(exc)})
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @router.post("/ai/react/runs/{session_id}/cancel")
+    async def post_cancel_react_run(session_id: str):
+        run = await cancel_react_gateway_run(session_id)
+        return {"success": True, "run": run}
+
+    @router.get("/ai/react/{session_id}/trace")
+    async def get_react_trace(session_id: str):
+        trace = get_react_session_trace(session_id)
+        if not trace:
+            raise HTTPException(status_code=404, detail="React trace not found")
+        return trace
+
+    return router
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="openwps backend")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.middleware("http")
+    async def protect_api_and_prevent_stale_frontend_assets(request: Request, call_next):
+        path = request.url.path
+        if (
+            path == "/api"
+            or path.startswith("/api/")
+            or path == "/openwps/api"
+            or path.startswith("/openwps/api/")
+        ):
+            try:
+                request.state.ai_writer_user = await authenticate_request(request)
+            except HTTPException as exc:
+                return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+        response = await call_next(request)
+        if (
+            path == "/"
+            or path.endswith(".html")
+            or path.endswith(".js")
+            or path.endswith(".css")
+        ):
+            apply_no_store_headers(response)
+        return response
+
+    app.include_router(create_api_router())
+
+    if DIST_DIR.exists():
+        app.mount("/assets", AppStaticFiles(directory=DIST_DIR / "assets"), name="assets")
+
+        @app.get("/favicon.svg")
+        async def favicon():
+            return FileResponse(DIST_DIR / "favicon.svg", headers={"Cache-Control": "public, max-age=86400"})
+
+        @app.get("/icons.svg")
+        async def icons():
+            return FileResponse(DIST_DIR / "icons.svg", headers={"Cache-Control": "public, max-age=86400"})
+
+        @app.get("/{full_path:path}")
+        async def spa_fallback(full_path: str):
+            if full_path == "api" or full_path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="API endpoint not found")
+            index = DIST_DIR / "index.html"
+            if index.exists():
+                return Response(index.read_bytes(), media_type="text/html; charset=utf-8")
+            return {"error": "dist 目录不存在，请先执行 npm run build"}
+
+    else:
+        @app.get("/")
+        async def no_dist():
+            return {"message": "dist 目录不存在，请执行 npm run build"}
+
+    return app

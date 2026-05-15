@@ -1,0 +1,10 @@
+{
+  "session_id": "omx-1778377872927-4lt2gt",
+  "native_session_id": "019df676-2b1a-7dd3-b02c-fbac955bc96f",
+  "started_at": "2026-05-10T01:51:16.045Z",
+  "cwd": "/data/songbinbin/Proj/Proj_051/AI_Writer",
+  "pid": 993078,
+  "platform": "linux",
+  "pid_start_ticks": 462833778,
+  "pid_cmdline": "/home/songbinbin/.nvm/versions/node/v20.20.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex --dangerously-bypass-approvals-and-sandbox -c model_instructions_file=\"/data/songbinbin/Proj/Proj_051/AI_Writer/.omx/state/sessions/omx-1778377872927-4lt2gt/AGENTS.md\""
+}

@@ -1,0 +1,35 @@
+{
+  "originalMode": "off",
+  "holders": [
+    {
+      "id": "3759724-1777891299844-7725d934aa8dc",
+      "pid": 3759724,
+      "platform": "linux",
+      "linuxStartTicks": 414176071
+    },
+    {
+      "id": "3152085-1777950899949-bd75fff9334dc",
+      "pid": 3152085,
+      "platform": "linux",
+      "linuxStartTicks": 420136084
+    },
+    {
+      "id": "95567-1777956429720-4f28d90e600cb",
+      "pid": 95567,
+      "platform": "linux",
+      "linuxStartTicks": 420689035
+    },
+    {
+      "id": "2200551-1778331181334-49294a14710cd",
+      "pid": 2200551,
+      "platform": "linux",
+      "linuxStartTicks": 458164218
+    },
+    {
+      "id": "992950-1778377876531-3ba9ddaac57cc",
+      "pid": 992950,
+      "platform": "linux",
+      "linuxStartTicks": 462833729
+    }
+  ]
+}

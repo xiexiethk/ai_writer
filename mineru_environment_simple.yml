@@ -1,0 +1,59 @@
+name: mineru
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # MinerU 核心依赖
+      - mineru==2.6.8
+      
+      # 深度学习框架
+      - torch==2.8.0
+      - torchvision==0.23.0
+      - torchaudio==2.8.0
+      - xformers==0.0.32.post1
+      
+      # CUDA 支持 (根据你的 CUDA 版本调整)
+      - cupy-cuda12x==13.6.0
+      - nvidia-cublas-cu12==12.8.4.1
+      - nvidia-cuda-runtime-cu12==12.8.90
+      - nvidia-cudnn-cu12==9.10.2.21
+      
+      # 模型和推理
+      - transformers==4.57.3
+      - vllm==0.11.0
+      - sentence-transformers==5.2.0
+      - accelerate==1.12.0
+      
+      # 计算机视觉
+      - opencv-python==4.12.0.88
+      - opencv-python-headless==4.12.0.88
+      - pillow==11.3.0
+      - albumentations==2.0.8
+      
+      # 文档处理
+      - pdfminer-six==20250506
+      - pypdf==6.5.0
+      - pikepdf==10.1.0
+      - pypdfium2==4.30.0
+      - pdftext==0.6.3
+      - img2pdf==0.6.3
+      - python-docx==1.2.0
+      - mammoth==1.11.0
+      - reportlab==4.4.7
+      
+      # 数据处理
+      - numpy==2.2.6
+      - pandas==2.3.3
+      - polars==1.36.1
+      
+      # Web 框架
+      - fastapi==0.128.0
+      - gradio==5.49.1
+      
+      # 工具库
+      - aiofiles==23.2.1
+      - loguru==0.7.3
+      - rich==14.2.0
+      - tqdm==4.67.1

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "branch_name": "main",
+      "worktree_path": "/data/songbinbin/Proj/Proj_051/AI_Writer",
+      "status": "active",
+      "created_at": "2026-05-01T01:30:27.949Z",
+      "updated_at": "2026-05-10T06:03:15.918Z"
+    }
+  ]
+}

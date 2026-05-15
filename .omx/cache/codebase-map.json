@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "worktreeRoot": "/data/songbinbin/Proj/Proj_051/AI_Writer",
+  "gitDir": "/data/songbinbin/Proj/Proj_051/AI_Writer/.git",
+  "indexMtimeMs": 1776358366857.0552,
+  "indexSize": 65453,
+  "map": "  backend/: auto-render, auto-render.min, auto-render, copy-tex, copy-tex.min, copy-tex, mathtex-script-type, mathtex-script-type.min, mathtex-script-type, mhchem\n  frontend/: pdf.worker.min, agent, auth, chat, document, documentProject, folder, main",
+  "createdAt": "2026-05-04T10:41:39.435Z"
+}

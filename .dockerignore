@@ -1,0 +1,26 @@
+# git / editor
+.git
+.gitignore
+.DS_Store
+
+# local dependencies and builds
+**/node_modules
+**/dist
+**/.venv
+**/venv
+**/__pycache__
+**/.pytest_cache
+**/*.tsbuildinfo
+
+# local runtime data and logs
+*.log
+*.db
+*.bak
+backend/uploads
+backend/parsed_output
+backend/data
+backend/test_output
+backend/tmp_tests
+openwps_server/data
+openwps_server/config/ai.json
+AI_Writer_source_2026-05-15

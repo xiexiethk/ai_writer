@@ -1,0 +1,60 @@
+# ==========================================
+# AI Writer Backend - Python Dependencies
+# ==========================================
+
+# ============ Web Framework ============
+fastapi>=0.115.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.18
+
+# ============ Data Validation ============
+pydantic>=2.9.0
+pydantic-settings>=2.2.0
+email-validator>=2.2.0
+
+# ============ HTTP Client ============
+httpx>=0.24.0
+
+# ============ Document Processing - Word ============
+python-docx>=1.1.0
+latex2word>=1.1.0
+
+# ============ Document Processing - PDF ============
+reportlab>=4.0.0
+img2pdf>=0.5.0
+pdfkit>=1.0.0
+pypdf>=3.0.0
+pikepdf>=8.0.0
+
+# ============ Document Processing - Other ============
+mammoth>=1.8.0
+markdown>=3.5.0
+markdownify>=1.1.0
+Pillow>=10.0.0
+
+# ============ Vector Database ============
+pymilvus>=2.6.0  # 支持混合检索和 BM25 功能
+
+# ============ Utilities ============
+beautifulsoup4>=4.12.0
+numpy>=1.24.0
+tqdm>=4.66.0  # 用于数据迁移进度显示
+
+# ============ LangChain & LangGraph ============
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langgraph>=0.2.0
+typing-extensions>=4.8.0
+
+# ============ OpenAI API ============
+openai>=1.0.0
+
+# ============ Database ============
+sqlalchemy>=2.0.0
+aiosqlite>=0.19.0
+
+# ============ Security ============
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+bcrypt>=4.0.1
+python-dotenv>=1.0.1

@@ -1,0 +1,88 @@
+{
+  "pid": 1193045,
+  "parent_pid": 2200573,
+  "started_at": "2026-05-12T14:18:45.208Z",
+  "cwd": "/data/songbinbin/Proj/Proj_051/AI_Writer",
+  "notify_script": "/home/songbinbin/.nvm/versions/node/v20.20.0/lib/node_modules/oh-my-codex/dist/scripts/notify-hook.js",
+  "authority_only": true,
+  "poll_ms": 75,
+  "effective_poll_ms": 75,
+  "idle_max_poll_ms": 1000,
+  "pid_file": null,
+  "max_lifetime_ms": 0,
+  "tracked_files": 0,
+  "seen_turns": 0,
+  "dispatch_drain": {
+    "enabled": true,
+    "max_per_tick": 5,
+    "run_count": 1,
+    "leader_only": true,
+    "last_tick_at": "2026-05-12T14:18:45.211Z",
+    "last_result": {
+      "processed": 0,
+      "skipped": 0,
+      "failed": 0
+    },
+    "last_error": null
+  },
+  "leader_nudge": {
+    "enabled": true,
+    "leader_only": true,
+    "stale_threshold_ms": 180000,
+    "precomputed_leader_stale": true,
+    "last_tick_at": "2026-05-12T14:18:45.212Z",
+    "last_error": null,
+    "run_count": 1
+  },
+  "ralph_continue_steer": {
+    "enabled": true,
+    "cadence_ms": 60000,
+    "message": "Ralph loop active continue",
+    "active": false,
+    "last_state_check_at": "2026-05-10T07:51:15.783Z",
+    "last_sent_at": "",
+    "cooldown_anchor_at": "",
+    "last_reason": "blocked_by_current_session",
+    "last_error": null,
+    "state_path": "",
+    "pane_id": "",
+    "pane_current_command": "",
+    "current_phase": "",
+    "subagent_session_id": "",
+    "active_subagent_thread_ids": [],
+    "shared_timestamp_path": "/data/songbinbin/Proj/Proj_051/AI_Writer/.omx/state/ralph-last-steer-at",
+    "shared_last_sent_at": "",
+    "singleton_lock_path": "/data/songbinbin/Proj/Proj_051/AI_Writer/.omx/state/ralph-continue-steer.lock"
+  },
+  "fallback_auto_nudge": {
+    "enabled": true,
+    "stall_ms": 5000,
+    "last_tick_at": "2026-05-12T14:18:45.242Z",
+    "last_turn_at": "2026-05-09T13:07:18.703Z",
+    "last_turn_count": 2,
+    "last_message": "- 恢复 Milvus standalone\n- 验证检索从本地降级切回 Milvus\n- 优化普通对话多轮记忆稳定性\n- 优化检索与对话整体时延\n- 用真实 vLLM 做 Agent 端到端最终验收",
+    "last_reason": "eligible_but_not_sent",
+    "last_error": null,
+    "last_nudged_signature": "",
+    "last_nudged_at": ""
+  },
+  "authority_backoff": {
+    "active": false,
+    "reason": "pid_missing",
+    "primary_pid": null,
+    "primary_last_tick_at": "",
+    "freshness_ms": null,
+    "threshold_ms": null
+  },
+  "adaptive_poll": {
+    "enabled": true,
+    "base_ms": 75,
+    "max_ms": 1000,
+    "current_ms": 75,
+    "idle_streak": 0,
+    "last_tick_at": "2026-05-12T14:18:45.247Z",
+    "last_activity_at": "2026-05-12T14:18:45.247Z",
+    "last_activity_reason": "leader_nudge"
+  },
+  "last_cycle_activity": "leader_nudge"
+}

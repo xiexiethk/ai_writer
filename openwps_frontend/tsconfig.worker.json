@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "skipLibCheck": true,
+    "strict": false,
+    "noEmitOnError": true,
+    "rootDir": ".",
+    "outDir": "server/node/.generated",
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "erasableSyntaxOnly": true
+  },
+  "include": [
+    "server/node/document_worker.ts",
+    "server/node/document_io_worker.ts",
+    "src/docx/**/*.ts",
+    "src/layout/**/*.ts",
+    "src/markdown/**/*.ts",
+    "src/shared/document/**/*.ts",
+    "src/fonts.ts"
+  ]
+}

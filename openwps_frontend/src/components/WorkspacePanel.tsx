@@ -1,0 +1,841 @@
+import React from 'react'
+import {
+  AlertCircle,
+  ChevronDown,
+  ChevronRight,
+  File,
+  FileText,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  HardDrive,
+  MoveRight,
+  MoreVertical,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Save,
+  Trash2,
+  Upload,
+  X,
+} from 'lucide-react'
+
+export interface WorkspaceSummary {
+  id: string
+  name: string
+  createdAt?: string
+  updatedAt?: string
+}
+
+export interface WorkspaceFileNode {
+  name: string
+  path: string
+  kind: 'directory' | 'file'
+  role: string
+  type?: string
+  extension?: string
+  size?: number
+  updatedAt?: string
+  editable?: boolean
+  readOnly?: boolean
+  isReference?: boolean
+  isMemory?: boolean
+  children?: WorkspaceFileNode[]
+}
+
+export interface WorkspaceFileRef {
+  workspaceId: string
+  filePath: string
+  fileType: string
+}
+
+interface WorkspacesResponse {
+  activeWorkspaceId: string
+  workspaces: WorkspaceSummary[]
+}
+
+interface WorkspaceDeleteResponse extends WorkspacesResponse {
+  success: boolean
+  workspaceId: string
+}
+
+interface WorkspaceTreeResponse {
+  workspaceId: string
+  root: WorkspaceFileNode
+}
+
+interface PendingCreateFile {
+  baseDir: string
+  memoryMode: boolean
+  value: string
+}
+
+interface Props {
+  onClose: () => void
+  activeFile?: WorkspaceFileRef | null
+  onOpenFile: (workspaceId: string, path: string) => Promise<void> | void
+  onSaveActiveFile?: () => Promise<void> | void
+  onActiveFileMoved?: (file: WorkspaceFileRef) => void
+  onWorkspaceChange?: (workspaceId: string) => void
+  onWorkspaceDeleted?: (workspaceId: string, activeWorkspaceId: string) => void
+  refreshToken?: number
+}
+
+function joinPath(dir: string, name: string) {
+  const cleanName = name.trim().replace(/^\/+/, '')
+  if (!dir) return cleanName
+  return `${dir.replace(/\/+$/, '')}/${cleanName}`
+}
+
+function parentPath(path: string) {
+  const index = path.lastIndexOf('/')
+  return index >= 0 ? path.slice(0, index) : ''
+}
+
+function typeLabel(node: WorkspaceFileNode) {
+  if (node.kind === 'directory') {
+    if (node.role === 'memoryFolder' || node.role === 'openwps') return '记忆目录'
+    return node.role === 'reference' ? '参考目录' : '文件夹'
+  }
+  if (node.role === 'memoryIndex') return '记忆索引'
+  if (node.role === 'memory') return '记忆'
+  if (node.type) return node.type.toUpperCase()
+  return node.extension?.toUpperCase() || 'FILE'
+}
+
+function isMemoryPath(path: string) {
+  return path === '.openwps/memory' || path.startsWith('.openwps/memory/')
+}
+
+function isMemorySelection(path: string) {
+  return path === '.openwps' || isMemoryPath(path)
+}
+
+function toMemoryApiPath(path: string) {
+  return path.replace(/^\.openwps\/memory\/?/, '')
+}
+
+function ensureMarkdownName(name: string) {
+  const trimmed = name.trim()
+  return /\.(md|markdown)$/i.test(trimmed) ? trimmed : `${trimmed}.md`
+}
+
+function pathAncestors(path: string) {
+  const parts = path.split('/').filter(Boolean)
+  const ancestors: string[] = []
+  for (let i = 1; i <= parts.length; i += 1) {
+    ancestors.push(parts.slice(0, i).join('/'))
+  }
+  return ancestors
+}
+
+export default function WorkspacePanel({
+  onClose,
+  activeFile,
+  onOpenFile,
+  onSaveActiveFile,
+  onActiveFileMoved,
+  onWorkspaceChange,
+  onWorkspaceDeleted,
+  refreshToken = 0,
+}: Props) {
+  const [workspaces, setWorkspaces] = React.useState<WorkspaceSummary[]>([])
+  const [workspaceId, setWorkspaceId] = React.useState('')
+  const [tree, setTree] = React.useState<WorkspaceFileNode | null>(null)
+  const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set(['_references', '.openwps', '.openwps/memory']))
+  const [selectedDir, setSelectedDir] = React.useState('')
+  const [preview, setPreview] = React.useState<{ path: string; content: string } | null>(null)
+  const [loading, setLoading] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+  const [dragActive, setDragActive] = React.useState(false)
+  const [openMenuPath, setOpenMenuPath] = React.useState<string | null>(null)
+  const [pendingCreate, setPendingCreate] = React.useState<PendingCreateFile | null>(null)
+  const fileInputRef = React.useRef<HTMLInputElement>(null)
+  const pendingCreateInputRef = React.useRef<HTMLInputElement>(null)
+  const pendingCreateSubmittingRef = React.useRef(false)
+
+  React.useEffect(() => {
+    if (!pendingCreate) return
+    window.requestAnimationFrame(() => {
+      pendingCreateInputRef.current?.focus()
+      pendingCreateInputRef.current?.select()
+    })
+  }, [pendingCreate?.baseDir, pendingCreate?.memoryMode])
+
+  React.useEffect(() => {
+    if (!openMenuPath) return undefined
+    const closeMenu = () => setOpenMenuPath(null)
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpenMenuPath(null)
+    }
+    document.addEventListener('click', closeMenu)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('click', closeMenu)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [openMenuPath])
+
+  const loadTree = React.useCallback(async (nextWorkspaceId: string) => {
+    if (!nextWorkspaceId) return
+    const response = await fetch(`/api/workspaces/${encodeURIComponent(nextWorkspaceId)}/tree`)
+    if (!response.ok) throw new Error(`读取工作区目录失败：HTTP ${response.status}`)
+    const data = await response.json() as WorkspaceTreeResponse
+    setTree(data.root)
+  }, [])
+
+  const loadWorkspaces = React.useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const response = await fetch('/api/workspaces')
+      if (!response.ok) throw new Error(`读取工作区失败：HTTP ${response.status}`)
+      const data = await response.json() as WorkspacesResponse
+      setWorkspaces(data.workspaces)
+      const nextId = data.activeWorkspaceId || data.workspaces[0]?.id || ''
+      setWorkspaceId(nextId)
+      onWorkspaceChange?.(nextId)
+      if (nextId) await loadTree(nextId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }, [loadTree, onWorkspaceChange])
+
+  React.useEffect(() => {
+    void loadWorkspaces()
+  }, [loadWorkspaces])
+
+  const refresh = React.useCallback(async () => {
+    if (!workspaceId) {
+      await loadWorkspaces()
+      return
+    }
+    setLoading(true)
+    setError(null)
+    try {
+      await loadTree(workspaceId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }, [loadTree, loadWorkspaces, workspaceId])
+
+  React.useEffect(() => {
+    if (refreshToken <= 0) return
+    void refresh()
+  }, [refresh, refreshToken])
+
+  const switchWorkspace = React.useCallback(async (nextId: string) => {
+    if (!nextId || nextId === workspaceId) return
+    setWorkspaceId(nextId)
+    setPreview(null)
+    setSelectedDir('')
+    try {
+      await fetch(`/api/workspaces/${encodeURIComponent(nextId)}/active`, { method: 'POST' })
+      onWorkspaceChange?.(nextId)
+      await loadTree(nextId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [loadTree, onWorkspaceChange, workspaceId])
+
+  const createWorkspace = React.useCallback(async () => {
+    const name = window.prompt('新工作区名称')
+    if (!name?.trim()) return
+    try {
+      const response = await fetch('/api/workspaces', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.trim() }),
+      })
+      if (!response.ok) throw new Error(`创建工作区失败：HTTP ${response.status}`)
+      await loadWorkspaces()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [loadWorkspaces])
+
+  const deleteWorkspace = React.useCallback(async () => {
+    if (!workspaceId) return
+    const currentWorkspace = workspaces.find(item => item.id === workspaceId)
+    const workspaceName = currentWorkspace?.name || workspaceId
+    const isDefaultWorkspace = workspaceId === 'default'
+    const confirmed = window.confirm(
+      isDefaultWorkspace
+        ? `清空默认工作区「${workspaceName}」？\n\n这会永久删除其中的文件，并重建系统目录。`
+        : `永久删除工作区「${workspaceName}」？\n\n其中的文件会一并删除，无法撤销。`,
+    )
+    if (!confirmed) return
+
+    setLoading(true)
+    setError(null)
+    try {
+      const response = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}`, { method: 'DELETE' })
+      if (!response.ok) {
+        let message = `删除工作区失败：HTTP ${response.status}`
+        try {
+          const data = await response.json() as { detail?: string }
+          if (data.detail) message = data.detail
+        } catch {
+          // keep HTTP fallback
+        }
+        throw new Error(message)
+      }
+      const data = await response.json() as WorkspaceDeleteResponse
+      const nextWorkspaceId = data.activeWorkspaceId || data.workspaces[0]?.id || ''
+      setWorkspaces(data.workspaces)
+      setWorkspaceId(nextWorkspaceId)
+      setSelectedDir('')
+      setPreview(null)
+      setPendingCreate(null)
+      setOpenMenuPath(null)
+      onWorkspaceChange?.(nextWorkspaceId)
+      onWorkspaceDeleted?.(data.workspaceId || workspaceId, nextWorkspaceId)
+      if (nextWorkspaceId) await loadTree(nextWorkspaceId)
+      else setTree(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }, [loadTree, onWorkspaceChange, onWorkspaceDeleted, workspaceId, workspaces])
+
+  const createFolder = React.useCallback(async () => {
+    if (!workspaceId) return
+    if (isMemorySelection(selectedDir)) {
+      setError('记忆目录中通过新建或移动 Markdown 记忆文件自动创建子目录。')
+      return
+    }
+    const name = window.prompt('新文件夹名称')
+    if (!name?.trim()) return
+    const path = joinPath(selectedDir, name)
+    try {
+      const response = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/folders/${encodeURIComponent(path)}`, { method: 'POST' })
+      if (!response.ok) throw new Error(`创建文件夹失败：HTTP ${response.status}`)
+      setExpanded(prev => new Set(prev).add(selectedDir))
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [refresh, selectedDir, workspaceId])
+
+  const createFile = React.useCallback(async () => {
+    if (!workspaceId) return
+    const baseDir = selectedDir === '.openwps' ? '.openwps/memory' : selectedDir
+    setOpenMenuPath(null)
+    setPreview(null)
+    setPendingCreate({
+      baseDir,
+      memoryMode: isMemorySelection(baseDir),
+      value: '',
+    })
+    setExpanded(prev => {
+      const next = new Set(prev)
+      for (const ancestor of pathAncestors(baseDir)) next.add(ancestor)
+      return next
+    })
+  }, [selectedDir, workspaceId])
+
+  const cancelPendingCreate = React.useCallback(() => {
+    pendingCreateSubmittingRef.current = false
+    setPendingCreate(null)
+  }, [])
+
+  const commitPendingCreate = React.useCallback(async () => {
+    if (!workspaceId || !pendingCreate || pendingCreateSubmittingRef.current) return
+    const rawName = pendingCreate.value.trim().replace(/^\/+/, '')
+    if (!rawName) {
+      cancelPendingCreate()
+      return
+    }
+    const fileName = pendingCreate.memoryMode ? ensureMarkdownName(rawName) : rawName
+    if (!pendingCreate.memoryMode && !/\.(docx|md|markdown|txt)$/i.test(fileName)) {
+      setError('请输入带扩展名的文件名：.docx / .md / .txt')
+      pendingCreateInputRef.current?.focus()
+      return
+    }
+    const path = joinPath(pendingCreate.baseDir, fileName)
+    if (pendingCreate.memoryMode && toMemoryApiPath(path) === 'MEMORY.md') {
+      setError('MEMORY.md 是固定索引文件，不能通过新建文件覆盖。')
+      pendingCreateInputRef.current?.focus()
+      return
+    }
+    pendingCreateSubmittingRef.current = true
+    try {
+      const response = pendingCreate.memoryMode
+        ? await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/files/${encodeURIComponent(toMemoryApiPath(path))}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
+          body: `---\nname: ${path.split('/').pop()?.replace(/\.(md|markdown)$/i, '') || 'memory'}\ndescription: \ntype: project\n---\n\n`,
+        })
+        : await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(path)}`, { method: 'PUT' })
+      if (!response.ok) {
+        let message = `创建文件失败：HTTP ${response.status}`
+        try {
+          const data = await response.json() as { detail?: string }
+          if (data.detail) message = data.detail
+        } catch {
+          // keep HTTP fallback
+        }
+        throw new Error(message)
+      }
+      setPendingCreate(null)
+      setExpanded(prev => {
+        const next = new Set(prev)
+        for (const ancestor of pathAncestors(parentPath(path))) next.add(ancestor)
+        return next
+      })
+      await refresh()
+      await onOpenFile(workspaceId, path)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      window.requestAnimationFrame(() => pendingCreateInputRef.current?.focus())
+    } finally {
+      pendingCreateSubmittingRef.current = false
+    }
+  }, [cancelPendingCreate, onOpenFile, pendingCreate, refresh, workspaceId])
+
+  const uploadFiles = React.useCallback(async (files: FileList | null) => {
+    if (!files || !workspaceId) return
+    setError(null)
+    try {
+      const memoryMode = isMemorySelection(selectedDir)
+      for (const file of Array.from(files)) {
+        let response: Response
+        if (memoryMode) {
+          if (!/\.(md|markdown)$/i.test(file.name)) throw new Error(`记忆目录只支持 Markdown：${file.name}`)
+          const targetDir = selectedDir === '.openwps' ? '.openwps/memory' : selectedDir
+          const path = joinPath(targetDir, file.name)
+          response = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/files/${encodeURIComponent(toMemoryApiPath(path))}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': file.type || 'text/markdown; charset=utf-8' },
+            body: await file.text(),
+          })
+        } else {
+          const formData = new FormData()
+          formData.append('file', file)
+          const query = selectedDir ? `?path=${encodeURIComponent(selectedDir)}` : ''
+          response = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/upload${query}`, {
+            method: 'POST',
+            body: formData,
+          })
+        }
+        if (!response.ok) throw new Error(`上传 ${file.name} 失败：HTTP ${response.status}`)
+      }
+      if (fileInputRef.current) fileInputRef.current.value = ''
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [refresh, selectedDir, workspaceId])
+
+  const previewFile = React.useCallback(async (node: WorkspaceFileNode) => {
+    if (!workspaceId) return
+    try {
+      const response = isMemoryPath(node.path)
+        ? await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/files/${encodeURIComponent(toMemoryApiPath(node.path))}`)
+        : await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(node.path)}/content`)
+      if (!response.ok) throw new Error(`读取预览失败：HTTP ${response.status}`)
+      const data = await response.json() as { content?: string }
+      setPreview({ path: node.path, content: data.content || '' })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [workspaceId])
+
+  const deleteNode = React.useCallback(async (node: WorkspaceFileNode) => {
+    setOpenMenuPath(null)
+    if (node.role === 'openwps' || node.role === 'memoryFolder' || node.role === 'memoryIndex') {
+      setError('该记忆系统节点不能删除。')
+      return
+    }
+    if (!workspaceId || !window.confirm(`删除 ${node.path}？`)) return
+    try {
+      const response = isMemoryPath(node.path)
+        ? await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/files/${encodeURIComponent(toMemoryApiPath(node.path))}`, { method: 'DELETE' })
+        : await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(node.path)}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(`删除失败：HTTP ${response.status}`)
+      if (preview?.path === node.path) setPreview(null)
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [preview?.path, refresh, workspaceId])
+
+  const renameNode = React.useCallback(async (node: WorkspaceFileNode) => {
+    setOpenMenuPath(null)
+    if (node.role === 'openwps' || node.role === 'memoryFolder' || node.role === 'memoryIndex') {
+      setError('该记忆系统节点不能重命名。')
+      return
+    }
+    if (!workspaceId) return
+    const nextName = window.prompt('新名称', node.name)
+    if (!nextName?.trim() || nextName.trim() === node.name) return
+    const nextPath = joinPath(parentPath(node.path), isMemoryPath(node.path) ? ensureMarkdownName(nextName) : nextName)
+    try {
+      const response = isMemoryPath(node.path)
+        ? await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/files/${encodeURIComponent(toMemoryApiPath(node.path))}/move`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ toPath: toMemoryApiPath(nextPath) }),
+        })
+        : await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(node.path)}/move`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ toPath: nextPath }),
+        })
+      if (!response.ok) throw new Error(`重命名失败：HTTP ${response.status}`)
+      const data = await response.json() as { workspaceId?: string; path?: string }
+      const renamedPath = data.path || nextPath
+      if (node.kind !== 'directory' && activeFile?.workspaceId === workspaceId && activeFile.filePath === node.path) {
+        onActiveFileMoved?.({
+          workspaceId: data.workspaceId || workspaceId,
+          filePath: renamedPath,
+          fileType: node.type || activeFile.fileType,
+        })
+      }
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [activeFile?.filePath, activeFile?.workspaceId, onActiveFileMoved, refresh, workspaceId])
+
+  const moveNode = React.useCallback(async (node: WorkspaceFileNode) => {
+    setOpenMenuPath(null)
+    if (node.role === 'openwps' || node.role === 'memoryFolder' || node.role === 'memoryIndex') {
+      setError('该记忆系统节点不能移动。')
+      return
+    }
+    if (!workspaceId) return
+    const nextPath = window.prompt('移动到工作区相对路径', node.path)
+    if (!nextPath?.trim() || nextPath.trim() === node.path) return
+    try {
+      const response = isMemoryPath(node.path)
+        ? await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/files/${encodeURIComponent(toMemoryApiPath(node.path))}/move`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ toPath: toMemoryApiPath(nextPath.trim()) || nextPath.trim() }),
+        })
+        : await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(node.path)}/move`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ toPath: nextPath.trim() }),
+        })
+      if (!response.ok) throw new Error(`移动失败：HTTP ${response.status}`)
+      const data = await response.json() as { workspaceId?: string; path?: string }
+      const movedPath = data.path || nextPath.trim()
+      if (node.kind !== 'directory' && activeFile?.workspaceId === workspaceId && activeFile.filePath === node.path) {
+        onActiveFileMoved?.({
+          workspaceId: data.workspaceId || workspaceId,
+          filePath: movedPath,
+          fileType: node.type || activeFile.fileType,
+        })
+      }
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [activeFile?.filePath, activeFile?.workspaceId, onActiveFileMoved, refresh, workspaceId])
+
+  const handleNodeActivate = React.useCallback(async (node: WorkspaceFileNode) => {
+    if (node.kind === 'directory') {
+      setSelectedDir(node.path)
+      setExpanded(prev => {
+        const next = new Set(prev)
+        if (next.has(node.path)) next.delete(node.path)
+        else next.add(node.path)
+        return next
+      })
+      return
+    }
+    if (node.editable) {
+      await onOpenFile(workspaceId, node.path)
+      setPreview(null)
+    } else {
+      await previewFile(node)
+    }
+  }, [onOpenFile, previewFile, workspaceId])
+
+  const renderPendingCreate = React.useCallback((depth: number): React.ReactNode => {
+    if (!pendingCreate) return null
+    const placeholder = pendingCreate.memoryMode ? 'name.md' : 'name.docx / folder/name.md'
+    return (
+      <div
+        key="__pending_create_file__"
+        className="flex h-8 items-center gap-1.5 rounded-md px-1.5 text-sm text-stone-700"
+        style={{ paddingLeft: 8 + depth * 14 }}
+      >
+        <span className="w-[13px]" />
+        <FileText size={15} className={pendingCreate.memoryMode ? 'text-emerald-600' : 'text-amber-600'} />
+        <input
+          ref={pendingCreateInputRef}
+          value={pendingCreate.value}
+          placeholder={placeholder}
+          onChange={event => setPendingCreate(current => current ? { ...current, value: event.target.value } : current)}
+          onKeyDown={event => {
+            if (event.nativeEvent.isComposing) return
+            if (event.key === 'Enter') {
+              event.preventDefault()
+              void commitPendingCreate()
+            }
+            if (event.key === 'Escape') {
+              event.preventDefault()
+              cancelPendingCreate()
+            }
+          }}
+          onBlur={event => {
+            if (pendingCreateSubmittingRef.current) return
+            if (event.currentTarget.value.trim()) void commitPendingCreate()
+            else cancelPendingCreate()
+          }}
+          className="h-6 min-w-0 flex-1 rounded-sm border border-amber-400 bg-[#fffdf8] px-1.5 text-sm text-stone-900 outline-none placeholder:text-stone-400"
+        />
+      </div>
+    )
+  }, [cancelPendingCreate, commitPendingCreate, pendingCreate])
+
+  const renderNode = React.useCallback((node: WorkspaceFileNode, depth = 0): React.ReactNode => {
+    const isDir = node.kind === 'directory'
+    const isExpanded = expanded.has(node.path)
+    const isActive = activeFile?.workspaceId === workspaceId && activeFile.filePath === node.path
+    const isSelectedDir = isDir && selectedDir === node.path
+    const isMenuOpen = openMenuPath === node.path
+    const Icon = isDir ? (isExpanded ? FolderOpen : Folder) : FileText
+    const iconClass = isDir ? (node.isMemory ? 'text-emerald-500' : 'text-amber-600') : node.isReference ? 'text-stone-400' : node.isMemory ? 'text-emerald-600' : 'text-amber-600'
+    const canMutateNode = node.role !== 'openwps' && node.role !== 'memoryFolder' && node.role !== 'memoryIndex'
+    return (
+      <div key={node.path || 'root'}>
+        <div
+          className={`group relative flex h-8 items-center gap-1.5 rounded-md px-1.5 text-sm ${
+            isActive
+              ? 'bg-amber-50 text-amber-800'
+              : isSelectedDir
+                ? 'bg-stone-100 text-stone-900'
+                : 'text-stone-700 hover:bg-[#f3ebde]'
+          }`}
+          style={{ paddingLeft: 8 + depth * 14 }}
+        >
+          <button
+            type="button"
+            onClick={() => { void handleNodeActivate(node) }}
+            className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+            title={node.path || node.name}
+          >
+            {isDir ? (isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />) : <span className="w-[13px]" />}
+            <Icon size={15} className={iconClass} />
+            <span className="truncate">{node.name}</span>
+            {(node.role === 'memory' || node.role === 'memoryIndex') && <span className="rounded bg-emerald-50 px-1 text-[10px] text-emerald-700">记忆</span>}
+            {node.isReference && !isDir && <span className="rounded bg-stone-100 px-1 text-[10px] text-stone-500">参考</span>}
+          </button>
+          {!isDir && (
+            <span className="hidden flex-shrink-0 text-[10px] text-stone-400 group-hover:block">{typeLabel(node)}</span>
+          )}
+          {canMutateNode && (
+            <button
+              type="button"
+              className={`${isMenuOpen ? 'flex' : 'hidden group-hover:flex'} h-6 w-6 flex-shrink-0 items-center justify-center rounded text-stone-400 hover:bg-[#fffaf2] hover:text-stone-700`}
+              title="更多"
+              onClick={(event) => {
+                event.stopPropagation()
+                setOpenMenuPath(current => current === node.path ? null : node.path)
+              }}
+            >
+              <MoreVertical size={14} />
+            </button>
+          )}
+          {canMutateNode && isMenuOpen && (
+            <div
+              className="absolute right-1 top-7 z-50 w-32 overflow-hidden rounded-xl border border-stone-200 bg-[#fffaf2] py-1 text-xs text-stone-700 shadow-[0_18px_40px_rgba(90,67,42,0.14)]"
+              onClick={event => event.stopPropagation()}
+            >
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-stone-100"
+                onClick={() => { void renameNode(node) }}
+              >
+                <Pencil size={13} />
+                <span>重命名</span>
+              </button>
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-stone-100"
+                onClick={() => { void moveNode(node) }}
+              >
+                <MoveRight size={13} />
+                <span>移动</span>
+              </button>
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-red-600 hover:bg-red-50"
+                onClick={() => { void deleteNode(node) }}
+              >
+                <Trash2 size={13} />
+                <span>删除</span>
+              </button>
+            </div>
+          )}
+        </div>
+        {isDir && isExpanded && (
+          <>
+            {pendingCreate?.baseDir === node.path && renderPendingCreate(depth + 1)}
+            {node.children?.map(child => renderNode(child, depth + 1))}
+          </>
+        )}
+      </div>
+    )
+  }, [activeFile?.filePath, activeFile?.workspaceId, deleteNode, expanded, handleNodeActivate, moveNode, openMenuPath, pendingCreate?.baseDir, renameNode, renderPendingCreate, selectedDir, workspaceId])
+
+  const rootChildren = tree?.children ?? []
+  const rootPendingInsertIndex = rootChildren.reduce(
+    (lastSystemIndex, node, index) => node.path === '.openwps' || node.path === '_references' ? index : lastSystemIndex,
+    -1,
+  )
+  const shouldRenderRootPending = pendingCreate?.baseDir === ''
+
+  return (
+    <div
+      data-openwps-workspace-panel="true"
+      className={`relative flex h-full flex-shrink-0 flex-col border-r bg-[#fbf7f0] ${dragActive ? 'border-amber-300 shadow-[inset_0_0_0_2px_rgba(191,109,46,0.16)]' : 'border-stone-200'}`}
+      style={{ width: 'clamp(300px, 22vw, 360px)' }}
+      onDragEnter={event => {
+        event.preventDefault()
+        setDragActive(true)
+      }}
+      onDragOver={event => {
+        event.preventDefault()
+        setDragActive(true)
+      }}
+      onDragLeave={event => {
+        event.preventDefault()
+        if (event.currentTarget === event.target) setDragActive(false)
+      }}
+      onDrop={event => {
+        event.preventDefault()
+        setDragActive(false)
+        void uploadFiles(event.dataTransfer.files)
+      }}
+    >
+      <div className="flex flex-shrink-0 items-center justify-between gap-2 border-b border-stone-200 px-3 py-2.5">
+        <div className="flex min-w-0 items-center gap-2">
+          <HardDrive size={18} className="text-amber-700" />
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold text-stone-900">工作区</div>
+            <div className="truncate text-[11px] text-stone-400">{selectedDir || '根目录'}</div>
+          </div>
+        </div>
+        <button onClick={onClose} className="flex h-7 w-7 items-center justify-center rounded-md text-stone-400 hover:bg-stone-100 hover:text-stone-700" title="关闭工作区">
+          <X size={16} />
+        </button>
+      </div>
+
+      <div className="flex flex-shrink-0 flex-col gap-2 border-b border-stone-200 px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <select
+            value={workspaceId}
+            onChange={event => { void switchWorkspace(event.target.value) }}
+            className="min-w-0 flex-1 rounded-md border border-stone-300 bg-[#fffdf8] px-2 py-1.5 text-xs text-stone-700 outline-none focus:border-amber-400"
+          >
+            {workspaces.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+          </select>
+          <button onClick={createWorkspace} className="flex h-7 w-7 items-center justify-center rounded-md border border-stone-300 text-stone-600 hover:bg-stone-100" title="新建工作区">
+            <Plus size={14} />
+          </button>
+          <button
+            onClick={() => { void deleteWorkspace() }}
+            className="flex h-7 w-7 items-center justify-center rounded-md border border-red-100 text-red-500 hover:bg-red-50 disabled:border-stone-200 disabled:text-stone-300 disabled:hover:bg-[#fffdf8]"
+            title={workspaceId === 'default' ? '清空默认工作区' : '删除当前工作区'}
+            disabled={!workspaceId || loading}
+          >
+            <Trash2 size={14} />
+          </button>
+          <button onClick={() => { void refresh() }} className="flex h-7 w-7 items-center justify-center rounded-md border border-stone-300 text-stone-600 hover:bg-stone-100" title="刷新">
+            <RefreshCw size={14} />
+          </button>
+        </div>
+        <div className="grid grid-cols-4 gap-1.5">
+          <button onClick={createFile} className="flex h-8 items-center justify-center rounded-md border border-stone-300 text-stone-600 hover:bg-stone-100" title="新建文件">
+            <File size={14} />
+          </button>
+          <button onClick={createFolder} className="flex h-8 items-center justify-center rounded-md border border-stone-300 text-stone-600 hover:bg-stone-100" title="新建文件夹">
+            <FolderPlus size={14} />
+          </button>
+          <button onClick={() => fileInputRef.current?.click()} className="flex h-8 items-center justify-center rounded-md border border-stone-300 text-stone-600 hover:bg-stone-100" title="上传到当前目录">
+            <Upload size={14} />
+          </button>
+          <button onClick={() => { void onSaveActiveFile?.() }} className="flex h-8 items-center justify-center rounded-md bg-amber-700 text-white hover:bg-amber-800 disabled:bg-amber-300" title="保存当前文件" disabled={!activeFile}>
+            <Save size={14} />
+          </button>
+        </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept=".docx,.txt,.md,.markdown,.pdf,.ppt,.pptx"
+          className="hidden"
+          onChange={event => { void uploadFiles(event.target.files) }}
+        />
+      </div>
+
+      {error && (
+        <div className="mx-3 mt-3 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-2.5 py-2 text-xs text-red-600">
+          <AlertCircle size={14} className="mt-0.5 flex-shrink-0" />
+          <span className="min-w-0 flex-1">{error}</span>
+          <button onClick={() => setError(null)} className="text-red-400 hover:text-red-600" title="关闭错误提示">
+            <X size={13} />
+          </button>
+        </div>
+      )}
+
+      {dragActive && (
+        <div className="mx-3 mt-3 rounded-md border border-dashed border-amber-300 bg-amber-50 px-3 py-2 text-center text-xs font-medium text-amber-700">
+          松开后上传到 {selectedDir || '根目录'}
+        </div>
+      )}
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
+        {loading && !tree ? (
+          <div className="mt-10 text-center text-sm text-stone-400">加载中...</div>
+        ) : rootChildren.length || pendingCreate ? (
+          <div className="space-y-0.5">
+            {shouldRenderRootPending && rootPendingInsertIndex < 0 && renderPendingCreate(0)}
+            {rootChildren.map((child, index) => (
+              <React.Fragment key={child.path || child.name}>
+                {renderNode(child)}
+                {shouldRenderRootPending && index === rootPendingInsertIndex && renderPendingCreate(0)}
+              </React.Fragment>
+            ))}
+          </div>
+        ) : (
+          <div className="mt-12 text-center text-sm text-stone-400">当前工作区为空</div>
+        )}
+      </div>
+
+      {preview && (
+        <div className="max-h-[34%] flex-shrink-0 border-t border-stone-200 bg-[#f6efe5]">
+          <div className="flex items-center justify-between gap-2 px-3 py-2">
+            <div className="truncate text-xs font-medium text-stone-700" title={preview.path}>{preview.path}</div>
+            <button onClick={() => setPreview(null)} className="text-stone-400 hover:text-stone-700" title="关闭预览">
+              <X size={14} />
+            </button>
+          </div>
+          <pre className="max-h-48 overflow-auto px-3 pb-3 text-xs leading-5 text-stone-600 whitespace-pre-wrap">{preview.content}</pre>
+        </div>
+      )}
+
+      <div className="flex flex-shrink-0 items-center justify-between border-t border-stone-200 px-3 py-2 text-[11px] text-stone-400">
+        <span>{activeFile?.filePath ? `当前：${activeFile.filePath}` : '未打开工作区文件'}</span>
+        <button
+          type="button"
+          onClick={() => setSelectedDir('')}
+          className="flex items-center gap-1 text-stone-500 hover:text-stone-800"
+          title="回到根目录"
+        >
+          根目录
+        </button>
+      </div>
+    </div>
+  )
+}

@@ -1,0 +1,735 @@
+"""
+Delta injection system for dynamic context updates.
+
+Modeled after Claude Code's attachment-based delta mechanism:
+- State is stored in message history (not in-memory)
+- Each turn scans messages to reconstruct announced state
+- Only changed content is injected as delta attachments
+- Compaction resets state → full re-announcement
+
+Architecture:
+1. AttachmentMessage — typed message carrying delta info
+2. State reconstruction — scan messages for prior attachments
+3. Delta computation — diff current vs announced state
+4. Injection — append delta as HumanMessage to conversation
+5. Compaction handling — re-announce full state after compact
+"""
+
+from __future__ import annotations
+import hashlib
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+
+# ─── Attachment Types ─────────────────────────────────────────────────────────
+
+ATTACHMENT_MARKER = "[系统附件]"
+WORKSPACE_DOCS_DELTA = "workspace_docs_delta"
+WORKSPACE_MEMORY_DELTA = "workspace_memory_delta"
+TEMPLATE_DELTA = "template_delta"
+CONTEXT_DELTA = "context_delta"
+OPENWPS_MEMORY_CONTEXT_OPEN = "<openwps-memory-context>"
+OPENWPS_MEMORY_CONTEXT_CLOSE = "</openwps-memory-context>"
+
+
+class AttachmentMessage:
+    """A message that carries delta attachment info.
+    
+    These are persisted in the conversation history so that state can be
+    reconstructed by scanning messages (no separate in-memory state needed).
+    """
+    def __init__(
+        self,
+        attachment_type: str,
+        added: list[dict] | None = None,
+        removed: list[dict] | None = None,
+        current: list[dict] | None = None,
+        updated: dict | None = None,
+        mode: str | None = None,
+        is_initial: bool = False,
+    ):
+        self.attachment_type = attachment_type
+        self.added = added or []
+        self.removed = removed or []
+        self.current = current or []
+        self.updated = updated
+        self.mode = mode or ""
+        self.is_initial = is_initial
+
+
+# ─── State Reconstruction ─────────────────────────────────────────────────────
+
+def _find_attachment_messages(
+    messages: list[Any],
+    attachment_type: str,
+) -> list[AttachmentMessage]:
+    """Scan message history to find all prior attachments of a given type.
+    
+    This is the core state reconstruction mechanism. Instead of storing state
+    in memory, we replay all delta attachments from the transcript.
+    
+    Modeled after Claude Code's pattern:
+      for msg in messages:
+          if msg.type == 'attachment' and msg.attachment.type == 'deferred_tools_delta':
+              for n in msg.attachment.addedNames: announced.add(n)
+              for n in msg.attachment.removedNames: announced.delete(n)
+    """
+    results = []
+    for msg in messages:
+        content = _extract_content(msg)
+        if not content:
+            continue
+        
+        attachment = _parse_attachment(content, attachment_type)
+        if attachment:
+            results.append(attachment)
+    
+    return results
+
+
+def _extract_content(msg: Any) -> str:
+    """Extract text content from a LangChain message."""
+    if hasattr(msg, "content"):
+        content = msg.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(parts)
+    return ""
+
+
+def _parse_attachment(content: str, attachment_type: str) -> AttachmentMessage | None:
+    """Parse an attachment from message content."""
+    marker = f"{ATTACHMENT_MARKER} type={attachment_type}"
+    if marker not in content:
+        return None
+    
+    start = content.find(marker)
+    if start == -1:
+        return None
+    
+    # Find JSON block after marker - handle nested objects
+    json_start = content.find("{", start)
+    if json_start == -1:
+        return None
+    
+    # Count braces to find the matching closing brace
+    depth = 0
+    json_end = json_start
+    for i in range(json_start, len(content)):
+        ch = content[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                json_end = i
+                break
+    
+    if depth != 0:
+        return None
+    
+    try:
+        payload = json.loads(content[json_start:json_end + 1])
+        return AttachmentMessage(
+            attachment_type=payload.get("type", attachment_type),
+            added=payload.get("added", []),
+            removed=payload.get("removed", []),
+            current=payload.get("current", []),
+            updated=payload.get("updated"),
+            mode=payload.get("mode"),
+            is_initial=payload.get("is_initial", False),
+        )
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+# ─── Workspace Docs Delta ─────────────────────────────────────────────────────
+
+def reconstruct_workspace_docs_state(
+    messages: list[Any],
+) -> set[str]:
+    """Reconstruct announced workspace docs state from message history.
+    
+    Returns set of doc_ids that have been announced to the model.
+    """
+    announced = set()
+    attachments = _find_attachment_messages(messages, WORKSPACE_DOCS_DELTA)
+    
+    for att in attachments:
+        if att.current:
+            announced = {
+                doc_id
+                for item in att.current
+                if (doc_id := item.get("id"))
+            }
+        for item in att.added:
+            doc_id = item.get("id")
+            if doc_id:
+                announced.add(doc_id)
+        for item in att.removed:
+            doc_id = item.get("id")
+            if doc_id:
+                announced.discard(doc_id)
+    
+    return announced
+
+
+def _workspace_doc_id(doc: dict) -> str | None:
+    doc_id = doc.get("id")
+    return str(doc_id) if doc_id else None
+
+
+def _summarize_workspace_doc(doc: dict) -> dict:
+    summary = {
+        "id": doc.get("id"),
+        "name": doc.get("name", "?"),
+    }
+    for key in ("type", "size", "textLength", "uploadedAt"):
+        if key in doc:
+            summary[key] = doc.get(key)
+    return summary
+
+
+def _workspace_doc_ids(docs: list[dict] | None) -> set[str]:
+    return {
+        doc_id
+        for doc in docs or []
+        if (doc_id := _workspace_doc_id(doc))
+    }
+
+
+def _append_workspace_doc_list(parts: list[str], docs: list[dict], *, marker: str) -> None:
+    for doc in docs:
+        name = doc.get("name", "?")
+        doc_id = doc.get("id", "?")
+        doc_type = doc.get("type", "?")
+        size = doc.get("size", 0)
+        text_length = doc.get("textLength", 0)
+        uploaded_at = doc.get("uploadedAt")
+        suffix = f", uploadedAt={uploaded_at}" if uploaded_at else ""
+        parts.append(f"  {marker} [{doc_id}] {name} ({doc_type}, {size} bytes, {text_length} chars{suffix})")
+
+
+def _format_workspace_docs_snapshot(
+    current_docs: list[dict],
+    *,
+    reason: str,
+    initial: bool = False,
+) -> str | None:
+    if not current_docs:
+        return None
+
+    parts = [f"{ATTACHMENT_MARKER} type={WORKSPACE_DOCS_DELTA}"]
+    payload = {
+        "type": WORKSPACE_DOCS_DELTA,
+        "mode": "snapshot",
+        "current": [_summarize_workspace_doc(doc) for doc in current_docs],
+        "added": [],
+        "removed": [],
+        "is_initial": initial,
+    }
+    parts.append(json.dumps(payload, ensure_ascii=False))
+    parts.append("")
+    parts.append("[当前工作区参考文档快照]")
+    if reason == "compact":
+        parts.append("这是上下文压缩后的工作区参考文档快照，用于恢复可用参考资料列表；它不表示本轮创建、发现或修改了文件。")
+    elif initial:
+        parts.append("这些是会话开始时已经可用的参考资料，不表示当前任务执行过程中创建、发现或修改了文件。")
+    else:
+        parts.append("这是当前可用参考资料列表，用于建立基线；它不表示本轮创建、发现或修改了文件。")
+    parts.append("除非用户要求引用/处理这些资料，或当前任务确实缺少外部参考，否则不要主动搜索工作区，也不要在最终回复中主动提及未使用的参考文件。")
+    parts.append("当前可用参考文档：")
+    _append_workspace_doc_list(parts, current_docs, marker="-")
+    return "\n".join(parts)
+
+
+def compute_workspace_docs_delta(
+    current_docs: list[dict],
+    messages: list[Any],
+    *,
+    initial: bool = False,
+    force_snapshot: bool = False,
+    previous_docs: list[dict] | None = None,
+) -> str | None:
+    """Compute delta for workspace docs changes.
+    
+    Scans messages to reconstruct what the model already knows,
+    then diffs against current state to find what changed.
+    
+    Returns formatted delta text, or None if no changes.
+    """
+    if initial or force_snapshot:
+        return _format_workspace_docs_snapshot(
+            current_docs,
+            reason="compact" if force_snapshot and not initial else "initial",
+            initial=initial,
+        )
+
+    prior_attachments = _find_attachment_messages(messages, WORKSPACE_DOCS_DELTA)
+    if previous_docs is not None:
+        announced_ids = _workspace_doc_ids(previous_docs)
+    elif prior_attachments:
+        announced_ids = reconstruct_workspace_docs_state(messages)
+    else:
+        return _format_workspace_docs_snapshot(current_docs, reason="baseline")
+
+    current_ids = _workspace_doc_ids(current_docs)
+    current_map = {
+        doc_id: doc
+        for doc in current_docs
+        if (doc_id := _workspace_doc_id(doc))
+    }
+    
+    added_ids = current_ids - announced_ids
+    removed_ids = announced_ids - current_ids
+    
+    if not added_ids and not removed_ids:
+        return None
+    
+    added_docs = [current_map[doc_id] for doc_id in added_ids if doc_id in current_map]
+    removed_docs = [{"id": doc_id} for doc_id in removed_ids]
+    
+    parts = [f"{ATTACHMENT_MARKER} type={WORKSPACE_DOCS_DELTA}"]
+    
+    payload = {
+        "type": WORKSPACE_DOCS_DELTA,
+        "mode": "delta",
+        "added": [{"id": d.get("id"), "name": d.get("name", "?")} for d in added_docs],
+        "removed": removed_docs,
+        "is_initial": False,
+    }
+    parts.append(json.dumps(payload, ensure_ascii=False))
+    
+    # Human-readable text for the model
+    parts.append("")
+    parts.append("[工作区文档变更]")
+    parts.append("以下仅为工作区参考资料 manifest 的真实变化；不要把未列在新增文档中的已有文件说成新增。只有用户要求引用/处理资料，或当前任务确实需要外部参考时，才搜索工作区。")
+    
+    if added_docs:
+        parts.append("新增文档：")
+        _append_workspace_doc_list(parts, added_docs, marker="+")
+    
+    if removed_ids:
+        parts.append("移除文档：")
+        for doc_id in removed_ids:
+            parts.append(f"  - [{doc_id}]")
+    
+    return "\n".join(parts)
+
+
+# ─── Workspace Memory Delta ───────────────────────────────────────────────────
+
+def _memory_state_from_context(context: dict) -> dict[str, Any] | None:
+    workspace_manifest = context.get("workspaceManifest")
+    if not isinstance(workspace_manifest, dict):
+        return None
+    memory = workspace_manifest.get("memory")
+    return memory if isinstance(memory, dict) else None
+
+
+def _memory_fingerprint(memory: dict[str, Any]) -> str:
+    entrypoint = memory.get("entrypoint") if isinstance(memory.get("entrypoint"), dict) else {}
+    manifest = memory.get("manifest") if isinstance(memory.get("manifest"), list) else []
+    selected = memory.get("selected") if isinstance(memory.get("selected"), list) else []
+    payload = {
+        "workspaceId": memory.get("workspaceId"),
+        "entrypointHash": entrypoint.get("contentHash") or entrypoint.get("updatedAt") or entrypoint.get("byteCount"),
+        "manifest": [
+            {
+                "path": item.get("path"),
+                "hash": item.get("contentHash"),
+                "updatedAt": item.get("updatedAt"),
+                "size": item.get("size"),
+            }
+            for item in manifest
+            if isinstance(item, dict)
+        ],
+        "selected": [
+            {
+                "path": item.get("path"),
+                "hash": item.get("contentHash"),
+                "updatedAt": item.get("updatedAt"),
+                "size": item.get("size"),
+                "truncated": item.get("truncated"),
+            }
+            for item in selected
+            if isinstance(item, dict)
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _memory_has_context(memory: dict[str, Any]) -> bool:
+    entrypoint = memory.get("entrypoint") if isinstance(memory.get("entrypoint"), dict) else {}
+    manifest = memory.get("manifest") if isinstance(memory.get("manifest"), list) else []
+    selected = memory.get("selected") if isinstance(memory.get("selected"), list) else []
+    return bool(str(entrypoint.get("content") or "").strip() or manifest or selected)
+
+
+def reconstruct_workspace_memory_fingerprint(messages: list[Any]) -> str | None:
+    current: str | None = None
+    attachments = _find_attachment_messages(messages, WORKSPACE_MEMORY_DELTA)
+    for att in attachments:
+        updated = att.updated if isinstance(att.updated, dict) else {}
+        fingerprint = updated.get("fingerprint")
+        if isinstance(fingerprint, str) and fingerprint:
+            current = fingerprint
+    return current
+
+
+def _append_memory_manifest(parts: list[str], manifest: list[dict[str, Any]], selected_paths: set[str]) -> None:
+    visible_manifest = [
+        item
+        for item in manifest
+        if isinstance(item, dict) and str(item.get("path") or "") not in selected_paths
+    ]
+    if not visible_manifest:
+        return
+    parts.append("可用记忆文件 manifest（未全文注入时请按需 workspace_read(path) 读取）：")
+    for item in visible_manifest[:40]:
+        path = str(item.get("path") or "")
+        memory_type = str(item.get("type") or "")
+        desc = str(item.get("description") or "")
+        suffix = f" [{memory_type}]" if memory_type else ""
+        parts.append(f"  - {path}{suffix}: {desc}".rstrip())
+
+
+def _format_workspace_memory_snapshot(memory: dict[str, Any], *, reason: str, initial: bool = False) -> str | None:
+    if not _memory_has_context(memory):
+        return None
+
+    selected = memory.get("selected") if isinstance(memory.get("selected"), list) else []
+    manifest = memory.get("manifest") if isinstance(memory.get("manifest"), list) else []
+    entrypoint = memory.get("entrypoint") if isinstance(memory.get("entrypoint"), dict) else {}
+    selected_paths = {
+        str(item.get("path") or "")
+        for item in selected
+        if isinstance(item, dict) and item.get("path")
+    }
+    fingerprint = _memory_fingerprint(memory)
+
+    parts = [f"{ATTACHMENT_MARKER} type={WORKSPACE_MEMORY_DELTA}"]
+    payload = {
+        "type": WORKSPACE_MEMORY_DELTA,
+        "mode": "snapshot" if initial or reason in {"initial", "compact", "baseline"} else "delta",
+        "updated": {
+            "workspaceId": memory.get("workspaceId"),
+            "fingerprint": fingerprint,
+            "entrypointPath": entrypoint.get("path"),
+            "selectedPaths": sorted(selected_paths),
+            "manifestCount": len(manifest),
+        },
+        "is_initial": initial,
+    }
+    parts.append(json.dumps(payload, ensure_ascii=False))
+    parts.append("")
+    parts.append("[工作区记忆上下文]")
+    if initial:
+        parts.append("这是会话开始时从当前工作区召回的长期记忆。")
+    elif reason == "compact":
+        parts.append("这是上下文压缩后重新召回的长期记忆快照。")
+    else:
+        parts.append("这是当前工作区长期记忆的最新快照。")
+    parts.append(OPENWPS_MEMORY_CONTEXT_OPEN)
+    parts.append("[System note: 以下是 OpenWPS 后端召回的工作区长期记忆，不是用户的新输入；请作为背景资料使用，不要在回复中复述本标记。]")
+    parts.append("")
+    parts.append(f"workspaceId: {memory.get('workspaceId') or ''}")
+
+    entrypoint_content = str(entrypoint.get("content") or "").strip()
+    if entrypoint_content:
+        parts.append("")
+        parts.append(".openwps/memory/MEMORY.md 记忆索引：")
+        parts.append(entrypoint_content)
+    elif manifest:
+        parts.append("")
+        parts.append(".openwps/memory/MEMORY.md 记忆索引为空，但存在具体记忆文件。")
+
+    if selected:
+        parts.append("")
+        parts.append("本轮已全文加载的记忆文件：")
+        for item in selected[:5]:
+            if not isinstance(item, dict):
+                continue
+            parts.append(f"--- Memory: {item.get('path')} ---")
+            parts.append(str(item.get("content") or "").strip())
+            if item.get("truncated"):
+                parts.append("[该记忆文件已截断；如需完整内容请 workspace_read(path)。]")
+
+    if manifest:
+        parts.append("")
+        _append_memory_manifest(parts, manifest, selected_paths)
+        if len(selected_paths) < len(manifest):
+            parts.append("如果当前任务涉及未全文加载的世界观、人物一致性、章节规划、项目背景或用户偏好，先用 workspace_read(path) 读取相关记忆再继续。")
+
+    parts.append("记忆可能过期；当记忆提到文件、函数、资料路径或当前事实时，先读取当前工作区真实文件验证。")
+    parts.append(OPENWPS_MEMORY_CONTEXT_CLOSE)
+    return "\n".join(parts)
+
+
+def compute_workspace_memory_delta(
+    context: dict,
+    messages: list[Any],
+    *,
+    initial: bool = False,
+    force_snapshot: bool = False,
+) -> str | None:
+    memory = _memory_state_from_context(context)
+    if not memory:
+        return None
+    if initial or force_snapshot:
+        return _format_workspace_memory_snapshot(
+            memory,
+            reason="compact" if force_snapshot and not initial else "initial",
+            initial=initial,
+        )
+
+    fingerprint = _memory_fingerprint(memory)
+    if reconstruct_workspace_memory_fingerprint(messages) == fingerprint:
+        return None
+    return _format_workspace_memory_snapshot(memory, reason="baseline")
+
+
+# ─── Template Delta ───────────────────────────────────────────────────────────
+
+def reconstruct_template_state(
+    messages: list[Any],
+) -> dict | None:
+    """Reconstruct current template state from message history.
+    
+    Returns the current template dict, or None if no template announced.
+    """
+    current = None
+    attachments = _find_attachment_messages(messages, TEMPLATE_DELTA)
+    
+    for att in attachments:
+        if att.updated:
+            current = att.updated
+        elif att.added:
+            current = att.added[0] if att.added else None
+        elif att.removed:
+            current = None
+    
+    return current
+
+
+def compute_template_delta(
+    current_template: dict | None,
+    messages: list[Any],
+) -> str | None:
+    """Compute delta for template changes."""
+    announced = reconstruct_template_state(messages)
+    
+    # Compare by serializing (handles nested dict comparison)
+    current_json = json.dumps(current_template, sort_keys=True) if current_template else None
+    announced_json = json.dumps(announced, sort_keys=True) if announced else None
+    
+    if current_json == announced_json:
+        return None
+    
+    parts = [f"{ATTACHMENT_MARKER} type={TEMPLATE_DELTA}"]
+    
+    payload = {
+        "type": TEMPLATE_DELTA,
+        "added": [current_template] if current_template else [],
+        "removed": [announced] if announced else [],
+        "updated": current_template,
+        "is_initial": announced is None,
+    }
+    parts.append(json.dumps(payload, ensure_ascii=False))
+    
+    # Human-readable text
+    parts.append("")
+    
+    if current_template is None:
+        parts.append("[模板已移除] 当前无激活模板。如需统一全文样式，请使用页面设置与批量样式工具。")
+    elif announced is None:
+        parts.append("[新模板] 当前激活模板：")
+        parts.append(f"context.activeTemplate = {json.dumps(current_template, ensure_ascii=False, indent=2)}")
+        parts.append("若用户要求按模板排版，优先遵循 templateText。")
+    else:
+        parts.append("[模板变更] 当前激活模板已更新：")
+        parts.append(f"context.activeTemplate = {json.dumps(current_template, ensure_ascii=False, indent=2)}")
+        parts.append("若用户要求按模板排版，优先遵循 templateText。")
+    
+    return "\n".join(parts)
+
+
+# ─── Context Delta (Selection, Preview, etc.) ─────────────────────────────────
+
+def reconstruct_context_state(
+    messages: list[Any],
+) -> dict:
+    """Reconstruct last known context from message history.
+    
+    Returns dict with selection, preview, etc.
+    """
+    context = {}
+    attachments = _find_attachment_messages(messages, CONTEXT_DELTA)
+    
+    for att in attachments:
+        if att.updated:
+            context.update(att.updated)
+    
+    return context
+
+
+def compute_context_delta(
+    current_context: dict,
+    messages: list[Any],
+    keys: list[str] | None = None,
+) -> str | None:
+    """Compute delta for context changes (selection, preview, etc.).
+    
+    Only checks specified keys (default: selection, preview).
+    """
+    if keys is None:
+        keys = ["selection", "preview"]
+    
+    announced = reconstruct_context_state(messages)
+    
+    changed = {}
+    for key in keys:
+        current_val = current_context.get(key)
+        announced_val = announced.get(key)
+        
+        # Compare by serializing
+        current_json = json.dumps(current_val, sort_keys=True) if current_val else None
+        announced_json = json.dumps(announced_val, sort_keys=True) if announced_val else None
+        
+        if current_json != announced_json:
+            changed[key] = current_val
+    
+    if not changed:
+        return None
+    
+    parts = [f"{ATTACHMENT_MARKER} type={CONTEXT_DELTA}"]
+    
+    payload = {
+        "type": CONTEXT_DELTA,
+        "updated": changed,
+    }
+    parts.append(json.dumps(payload, ensure_ascii=False))
+    
+    # Human-readable text
+    parts.append("")
+    parts.append("[上下文变更]")
+    
+    if "selection" in changed:
+        sel = changed["selection"]
+        if sel:
+            parts.append("context.selection = " + json.dumps(sel, ensure_ascii=False, indent=2))
+            parts.append("选区已更新，请按新选区进行操作。")
+        else:
+            parts.append("context.selection = null")
+            parts.append("选区已清除。")
+    
+    if "preview" in changed:
+        prev = changed["preview"]
+        if prev:
+            parts.append("context.preview 已更新。")
+    
+    return "\n".join(parts)
+
+
+# ─── Full Delta Computation ───────────────────────────────────────────────────
+
+def compute_all_deltas(
+    context: dict,
+    messages: list[Any],
+    force_full: bool = False,
+    previous_workspace_docs: list[dict] | None = None,
+) -> list[str]:
+    """Compute all delta attachments for the current turn.
+    
+    If force_full=True (e.g., after compaction), announces full state.
+    Otherwise, only announces changes.
+    """
+    deltas = []
+    
+    if force_full:
+        # Full re-announcement after compaction is a snapshot, not a change event.
+        docs_delta = compute_workspace_docs_delta(
+            context.get("workspaceDocs", []),
+            [],
+            force_snapshot=True,
+        )
+        memory_delta = compute_workspace_memory_delta(
+            context,
+            [],
+            force_snapshot=True,
+        )
+        template_delta = compute_template_delta(
+            context.get("activeTemplate"),
+            [],
+        )
+        context_delta = compute_context_delta(
+            context,
+            [],
+        )
+    else:
+        docs_delta = compute_workspace_docs_delta(
+            context.get("workspaceDocs", []),
+            messages,
+            previous_docs=previous_workspace_docs,
+        )
+        memory_delta = compute_workspace_memory_delta(
+            context,
+            messages,
+        )
+        template_delta = compute_template_delta(
+            context.get("activeTemplate"),
+            messages,
+        )
+        context_delta = compute_context_delta(
+            context,
+            messages,
+        )
+    
+    if docs_delta:
+        deltas.append(docs_delta)
+    if memory_delta:
+        deltas.append(memory_delta)
+    if template_delta:
+        deltas.append(template_delta)
+    if context_delta:
+        deltas.append(context_delta)
+    
+    return deltas
+
+
+# ─── Initial Full Context ─────────────────────────────────────────────────────
+
+def build_initial_context_attachment(context: dict) -> str:
+    """Build full context attachment for session start.
+    
+    This is the initial state announcement, equivalent to passing
+    empty messages to compute_all_deltas(force_full=True).
+    """
+    parts = []
+    
+    docs_delta = compute_workspace_docs_delta(context.get("workspaceDocs", []), [], initial=True)
+    if docs_delta:
+        parts.append(docs_delta)
+
+    memory_delta = compute_workspace_memory_delta(context, [], initial=True)
+    if memory_delta:
+        parts.append(memory_delta)
+    
+    template_delta = compute_template_delta(context.get("activeTemplate"), [])
+    if template_delta:
+        parts.append(template_delta)
+    
+    context_delta = compute_context_delta(context, [])
+    if context_delta:
+        parts.append(context_delta)
+    
+    return "\n\n".join(parts) if parts else ""
