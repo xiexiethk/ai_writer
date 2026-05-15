@@ -2658,8 +2658,7 @@ export default function AISidebar({
   useEffect(() => {
     const sessionId = documentSessionInfo?.id
     if (!sessionId) return
-    // 直连后端端口，绕开 Vite proxy 连接池
-    const source = new EventSource(`http://localhost:28000/openwps/api/doc-sessions/${sessionId}/events`)
+    const source = new EventSource(`/api/doc-sessions/${sessionId}/events`)
     source.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data) as Record<string, unknown>

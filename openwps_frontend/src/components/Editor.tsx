@@ -2658,9 +2658,7 @@ export const Editor: React.FC = () => {
   useEffect(() => {
     const sessionId = documentSessionInfo?.id
     if (!sessionId) return undefined
-    // 直接连后端端口，避免和 Vite HMR 争 localhost:5173 的连接池
-    const directUrl = `http://localhost:28000/openwps/api/doc-sessions/${sessionId}/events`
-    const source = new EventSource(directUrl)
+    const source = new EventSource(`/api/doc-sessions/${sessionId}/events`)
     source.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data) as Record<string, unknown>
