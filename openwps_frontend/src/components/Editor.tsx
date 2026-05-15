@@ -2658,11 +2658,8 @@ export const Editor: React.FC = () => {
   useEffect(() => {
     const sessionId = documentSessionInfo?.id
     if (!sessionId) return undefined
-    let reconnectCount = 0
-    const MAX_RECONNECT = 3
     const source = new EventSource(`/api/doc-sessions/${sessionId}/events`)
     source.onmessage = (event) => {
-      reconnectCount = 0
       try {
         const data = JSON.parse(event.data) as Record<string, unknown>
         if (data.type === 'snapshot') {
@@ -2721,12 +2718,7 @@ export const Editor: React.FC = () => {
       }
     }
     source.onerror = () => {
-      reconnectCount++
-      if (reconnectCount > MAX_RECONNECT) {
-        source.close()
-        return
-      }
-      console.warn('当前文档会话事件连接异常（第 ' + reconnectCount + ' 次）')
+      console.warn('当前文档会话事件连接异常')
     }
     return () => source.close()
   }, [applyDocumentState, clearImportedDocxCompatibility, documentSessionInfo?.id, rememberDocumentSession, repaginate])

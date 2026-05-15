@@ -2658,11 +2658,8 @@ export default function AISidebar({
   useEffect(() => {
     const sessionId = documentSessionInfo?.id
     if (!sessionId) return
-    let reconnectCount = 0
-    const MAX_RECONNECT = 3
     const source = new EventSource(`/api/doc-sessions/${sessionId}/events`)
     source.onmessage = (event) => {
-      reconnectCount = 0
       try {
         const data = JSON.parse(event.data) as Record<string, unknown>
         applyDocumentEventRecords(data, { ignoreOwnClientPatch: true, skipSnapshotApply: true })
@@ -2671,12 +2668,7 @@ export default function AISidebar({
       }
     }
     source.onerror = () => {
-      reconnectCount++
-      if (reconnectCount > MAX_RECONNECT) {
-        source.close()
-        return
-      }
-      console.warn('后端文档事件连接异常（第 ' + reconnectCount + ' 次）')
+      console.warn('后端文档事件连接异常')
     }
     return () => source.close()
   }, [applyDocumentEventRecords, documentSessionInfo?.id])
