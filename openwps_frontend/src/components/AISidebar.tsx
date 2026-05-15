@@ -2658,7 +2658,7 @@ export default function AISidebar({
   useEffect(() => {
     const sessionId = documentSessionInfo?.id
     if (!sessionId) return
-    const source = new EventSource(`/api/doc-sessions/${sessionId}/events`)
+    const source = new EventSource(`/openwps/api/doc-sessions/${sessionId}/events`)
     source.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data) as Record<string, unknown>

@@ -21,6 +21,9 @@ export default defineConfig({
       '/openwps': {
         target: 'http://127.0.0.1:28000',
         changeOrigin: true,
+        // SSE 长连接需要无限超时
+        timeout: 0,
+        proxyTimeout: 0,
       },
     },
   },
