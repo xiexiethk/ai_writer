@@ -113,9 +113,9 @@ openwps_server/data/agents/
 # Local scripts
 /scripts/
 
-# Root level package files (should be in frontend/)
-package-lock.json
-package.json
+# Root level package files only
+/package-lock.json
+/package.json
 
 # Claude Code skills
 .claude/
