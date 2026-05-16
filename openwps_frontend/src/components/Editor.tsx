@@ -2344,7 +2344,14 @@ export const Editor: React.FC = () => {
       })
       return
     }
-    const data = await readJsonResponse<{ version?: number }>(response)
+    const data = await readJsonResponse<{ version?: number; versionConflict?: boolean }>(response)
+    if (data.versionConflict) {
+      rememberDocumentSession({
+        id: current.id,
+        version: Number(data.version ?? current.version) || current.version,
+      })
+      return
+    }
     rememberDocumentSession({ id: current.id, version: Number(data.version ?? current.version + 1) || current.version + 1 })
     await registerActiveDocumentSession(current.id)
   }, [activeWorkspaceFile?.filePath, activeWorkspaceFile?.fileType, activeWorkspaceFile?.workspaceId, currentDocumentName, registerActiveDocumentSession, rememberDocumentSession])
@@ -2662,24 +2669,25 @@ export const Editor: React.FC = () => {
     source.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data) as Record<string, unknown>
-        if (data.type === 'snapshot') {
-          const version = Number(data.version ?? documentSessionRef.current?.version ?? 1) || 1
-          rememberDocumentSession({ id: sessionId, version })
-          return
-        }
         const eventVersion = typeof data.version === 'number' ? data.version : undefined
-        if (eventVersion !== undefined && eventVersion <= (documentSessionRef.current?.version ?? 0)) return
+        // snapshot 事件在初次连接 / 重连时由后端发送，携带权威 docJson 与 pageConfig。
+        // 旧实现在此 return，导致 LLM 工具修改文档后只要 SSE 中途断过就再也无法同步到前端。
+        // 这里改为：当 snapshot 比本地版本新时，把 docJson / pageConfig 应用到编辑器。
+        const isSnapshot = data.type === 'snapshot'
+        if (!isSnapshot && eventVersion !== undefined && eventVersion <= (documentSessionRef.current?.version ?? 0)) return
         if (data.source === 'client_patch' && data.originClientId === documentClientIdRef.current) {
           if (eventVersion !== undefined) rememberDocumentSession({ id: sessionId, version: eventVersion })
           return
         }
-        const nextDocJson = data.type === 'document_replace'
+        const localVersion = documentSessionRef.current?.version ?? 0
+        const snapshotIsNewer = isSnapshot && (eventVersion === undefined || eventVersion > localVersion)
+        const nextDocJson = (data.type === 'document_replace' || (isSnapshot && snapshotIsNewer))
           && data.docJson
           && typeof data.docJson === 'object'
           && !Array.isArray(data.docJson)
           ? data.docJson as PMNodeJSON
           : null
-        const nextPageConfig = data.type === 'page_config_changed'
+        const nextPageConfig = (data.type === 'page_config_changed' || (isSnapshot && snapshotIsNewer))
           && data.pageConfig
           && typeof data.pageConfig === 'object'
           && !Array.isArray(data.pageConfig)
@@ -2717,10 +2725,53 @@ export const Editor: React.FC = () => {
         console.warn('解析当前文档会话事件失败', error)
       }
     }
+    let lastErrorWarnAt = 0
     source.onerror = () => {
-      console.warn('当前文档会话事件连接异常')
+      // 不主动 close，让浏览器原生 EventSource 自动重连。重连后后端会下发 snapshot，
+      // 上面 onmessage 会把权威 docJson/pageConfig 重新覆盖到本地，自愈。
+      // EventSource 在重连时也会触发 onerror，正常情况下浏览器会自动恢复。
+      // 这里限频打日志，5 秒内最多 1 次，避免热重载 / 瞬时抖动刷屏。
+      const now = Date.now()
+      if (now - lastErrorWarnAt > 5000) {
+        console.debug('当前文档会话事件连接抖动，等待自动重连')
+        lastErrorWarnAt = now
+      }
     }
-    return () => source.close()
+    // 兜底轮询：dev 环境 Vite proxy 偶发会让 SSE 长连接哑掉但不报错，
+    // 这里每 10s 主动比对一次后端 version，若有更新就拉 snapshot 应用，确保不丢更新。
+    const pollTimer = window.setInterval(async () => {
+      try {
+        const localVersion = documentSessionRef.current?.version ?? 0
+        const response = await fetch(`/api/doc-sessions/${sessionId}`, {
+          headers: { Authorization: `Bearer ${localStorage.getItem('token')?.trim() ?? ''}` },
+        })
+        if (!response.ok) return
+        const snapshot = await response.json() as Record<string, unknown>
+        const remoteVersion = typeof snapshot.version === 'number' ? snapshot.version : 0
+        if (remoteVersion <= localVersion) return
+        const nextDocJson = snapshot.docJson && typeof snapshot.docJson === 'object' && !Array.isArray(snapshot.docJson)
+          ? snapshot.docJson as PMNodeJSON
+          : null
+        const nextPageConfig = snapshot.pageConfig && typeof snapshot.pageConfig === 'object' && !Array.isArray(snapshot.pageConfig)
+          ? snapshot.pageConfig as PageConfig
+          : null
+        if (nextDocJson) {
+          if (documentModeRef.current === 'markdown') {
+            applyDocumentState(nextDocJson, nextPageConfig ?? DEFAULT_PAGE_CONFIG)
+          } else {
+            applyDocumentState(nextDocJson, nextPageConfig ?? pageConfigRef.current)
+            clearImportedDocxCompatibility()
+          }
+        }
+        rememberDocumentSession({ id: sessionId, version: remoteVersion })
+      } catch {
+        // 静默忽略，下个周期再试
+      }
+    }, 10000)
+    return () => {
+      window.clearInterval(pollTimer)
+      source.close()
+    }
   }, [applyDocumentState, clearImportedDocxCompatibility, documentSessionInfo?.id, rememberDocumentSession, repaginate])
 
   const cancelAICopilot = useCallback(() => {
@@ -3132,6 +3183,14 @@ export const Editor: React.FC = () => {
         })
       }
     } catch (error) {
+      // 用户在标题输入框边打字边切换 / 重新挂载组件时，浏览器会把飞行中的 fetch
+      // abort 掉，nginx 端会记录为 499。这种 race 不是真正的失败，文档内容仍然正常，
+      // 静默忽略即可，避免污染 console 与误导用户。
+      const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof TypeError && /fetch/i.test(message)) {
+        console.debug('[Editor] rename workspace file from title aborted by browser', message)
+        return
+      }
       console.error('[Editor] rename workspace file from title failed', error)
       window.alert(`重命名工作区文件失败：${error instanceof Error ? error.message : String(error)}`)
     }
@@ -3159,6 +3218,11 @@ export const Editor: React.FC = () => {
       })
     }
   }, [registerActiveDocumentSession])
+
+  const handleWorkspaceChange = useCallback((workspaceId: string) => {
+    setCurrentWorkspaceId(workspaceId)
+    // 工作区切换只改变目录事实源；已打开文件保持到用户显式切换。
+  }, [])
 
   const handleWorkspaceDeleted = useCallback((deletedWorkspaceId: string, nextWorkspaceId: string) => {
     setCurrentWorkspaceId(nextWorkspaceId)
@@ -4600,10 +4664,7 @@ export const Editor: React.FC = () => {
             onOpenFile={handleOpenWorkspaceFile}
             onSaveActiveFile={handleSaveWorkspaceFile}
             onActiveFileMoved={handleWorkspaceActiveFileMoved}
-            onWorkspaceChange={(workspaceId) => {
-              setCurrentWorkspaceId(workspaceId)
-              // 工作区切换只改变目录事实源；已打开文件保持到用户显式切换。
-            }}
+            onWorkspaceChange={handleWorkspaceChange}
             onWorkspaceDeleted={handleWorkspaceDeleted}
             refreshToken={workspaceRefreshToken}
           />
@@ -4966,6 +5027,7 @@ export const Editor: React.FC = () => {
             templates={templates}
             activeTemplate={activeTemplate}
             activeWorkspaceFile={activeWorkspaceFile}
+            externalDocumentSession={documentSessionInfo}
             onModelContextChange={(next) => {
               setCurrentAIProviderId(next.providerId)
               setCurrentAIModel(next.model)

@@ -279,7 +279,12 @@ async def update_document_session_from_client(session_id: str, payload: dict[str
     session = await get_document_session(session_id)
     base_version = payload.get("baseVersion")
     if isinstance(base_version, int) and base_version != session.version:
-        raise HTTPException(status_code=409, detail={"message": "Document version conflict", "version": session.version})
+        # 不再抛 409。版本冲突属于正常并发：客户端拿着旧 baseVersion 来 patch，
+        # 但后端 version 已被 LLM 工具或其它客户端推进。返回当前权威 snapshot 让前端
+        # 直接对齐即可，避免浏览器 console 出现红色 4xx 误导用户。
+        snapshot = session.snapshot()
+        snapshot["versionConflict"] = True
+        return snapshot
 
     doc_json = payload.get("docJson")
     page_config = payload.get("pageConfig")

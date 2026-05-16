@@ -426,6 +426,11 @@ interface Props {
   templates: TemplateSummary[]
   activeTemplate: TemplateRecord | null
   activeWorkspaceFile?: { workspaceId: string; filePath: string; fileType: string } | null
+  /**
+   * Editor 当前激活的后端文档会话。AISidebar 必须严格使用这个 id，
+   * 否则会出现"用户切换了工作区文件，但 AI 仍把内容写入旧 session"的 bug。
+   */
+  externalDocumentSession?: { id: string; version: number } | null
   onModelContextChange?: (next: { providerId: string | null, model: string | null }) => void
   onActivateTemplate: (templateId: string) => Promise<void> | void
   onOpenTemplateManager: () => void
@@ -2149,6 +2154,7 @@ export default function AISidebar({
   templates,
   activeTemplate,
   activeWorkspaceFile,
+  externalDocumentSession,
   onModelContextChange,
   onActivateTemplate,
   onOpenTemplateManager,
@@ -2484,6 +2490,21 @@ export default function AISidebar({
     })
   }, [])
 
+  // Editor 才是文档会话的事实源（它知道用户当前打开的是哪份工作区文件）。
+  // 当 Editor 切换文件 / 创建新会话 / 收到 SSE 更新版本时，必须把它的 sessionInfo
+  // 反向同步到 AISidebar 内部的 ref，否则 AI 会把工具调用塞进过期 session，
+  // 表现为"工具调用全部成功，但编辑器一直空白"。
+  useEffect(() => {
+    if (!externalDocumentSession) return
+    const current = documentSessionRef.current
+    if (
+      current
+      && current.id === externalDocumentSession.id
+      && current.version === externalDocumentSession.version
+    ) return
+    rememberDocumentSession(externalDocumentSession)
+  }, [externalDocumentSession, rememberDocumentSession])
+
   const registerActiveDocumentSession = useCallback(async (sessionId: string) => {
     try {
       await fetch(`/api/doc-sessions/${sessionId}/active`, {
@@ -2541,11 +2562,36 @@ export default function AISidebar({
       return createDocumentSession()
     }
     if (response.status === 409) {
-      rememberDocumentSession(null)
-      return syncDocumentSession(contextSnapshot)
+      // 版本冲突：后端 version 已经被工具调用 / 其它客户端更新过。
+      // 不要新建 session，也不要在这里重 patch（会和正在到达的 SSE 事件互相覆盖）。
+      // 拉一次最新 version 写回 ref，下一轮 SSE/工具事件会把权威 docJson 同步过来。
+      try {
+        const latest = await fetch(`/api/doc-sessions/${current.id}`, {
+          headers: { 'Content-Type': 'application/json' },
+        })
+        if (latest.ok) {
+          const data = await latest.json() as { version?: number }
+          rememberDocumentSession({
+            id: current.id,
+            version: Number(data.version ?? current.version) || current.version,
+          })
+        }
+      } catch (error) {
+        console.warn('409 后拉取最新 doc session 失败', error)
+      }
+      return current.id
     }
     if (!response.ok) throw new Error(`同步后端文档会话失败：HTTP ${response.status}`)
-    const data = await response.json() as { version?: number }
+    const data = await response.json() as { version?: number; versionConflict?: boolean }
+    // 后端在 baseVersion 不一致时返回 200 + versionConflict=true + 当前最新 snapshot，
+    // 这里只更新本地 version，不再发新 patch（让 SSE / 工具事件继续推进文档）。
+    if (data.versionConflict) {
+      rememberDocumentSession({
+        id: current.id,
+        version: Number(data.version ?? current.version) || current.version,
+      })
+      return current.id
+    }
     rememberDocumentSession({ id: current.id, version: Number(data.version ?? current.version + 1) || current.version + 1 })
     await registerActiveDocumentSession(current.id)
     return current.id
@@ -2669,6 +2715,7 @@ export default function AISidebar({
     }
     source.onerror = () => {
       console.warn('后端文档事件连接异常')
+      source.close()
     }
     return () => source.close()
   }, [applyDocumentEventRecords, documentSessionInfo?.id])

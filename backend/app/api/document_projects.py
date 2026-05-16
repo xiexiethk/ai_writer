@@ -1407,7 +1407,7 @@ async def export_word(
 async def preview_html(
     project_id: str,
     request: Request,
-    token: str | None = Query(None),
+    token: Optional[str] = Query(None),
 ):
     """
     生成HTML预览

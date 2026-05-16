@@ -30,6 +30,7 @@ venv.bak/
 
 # Node.js
 node_modules/
+**/node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -106,6 +107,13 @@ openwps_server/data/plans/
 openwps_server/data/tasks/
 openwps_server/data/agent_runs/
 openwps_server/data/agents/
+# OpenWPS workspace 自动版本快照（每次 AI 工具写入会生成 .docx 快照，本地累积太快）
+openwps_server/data/workspaces/**/.openwps/versions/
+openwps_server/data/workspaces/**/.openwps/index/
+# OpenWPS 用户实际工作区文件（运行时生成，不该入库）
+openwps_server/data/workspaces/**/files/*.docx
+openwps_server/data/workspaces/**/files/*.md
+!openwps_server/data/workspaces/**/files/.openwps/
 
 # Backup files
 *.bak

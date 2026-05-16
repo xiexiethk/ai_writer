@@ -176,6 +176,13 @@ export default function WorkspacePanel({
     }
   }, [openMenuPath])
 
+  const onWorkspaceChangeRef = React.useRef(onWorkspaceChange)
+  const onWorkspaceDeletedRef = React.useRef(onWorkspaceDeleted)
+  React.useEffect(() => {
+    onWorkspaceChangeRef.current = onWorkspaceChange
+    onWorkspaceDeletedRef.current = onWorkspaceDeleted
+  }, [onWorkspaceChange, onWorkspaceDeleted])
+
   const loadTree = React.useCallback(async (nextWorkspaceId: string) => {
     if (!nextWorkspaceId) return
     const response = await fetch(`/api/workspaces/${encodeURIComponent(nextWorkspaceId)}/tree`)
@@ -194,14 +201,14 @@ export default function WorkspacePanel({
       setWorkspaces(data.workspaces)
       const nextId = data.activeWorkspaceId || data.workspaces[0]?.id || ''
       setWorkspaceId(nextId)
-      onWorkspaceChange?.(nextId)
+      onWorkspaceChangeRef.current?.(nextId)
       if (nextId) await loadTree(nextId)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setLoading(false)
     }
-  }, [loadTree, onWorkspaceChange])
+  }, [loadTree])
 
   React.useEffect(() => {
     void loadWorkspaces()
@@ -235,12 +242,12 @@ export default function WorkspacePanel({
     setSelectedDir('')
     try {
       await fetch(`/api/workspaces/${encodeURIComponent(nextId)}/active`, { method: 'POST' })
-      onWorkspaceChange?.(nextId)
+      onWorkspaceChangeRef.current?.(nextId)
       await loadTree(nextId)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
-  }, [loadTree, onWorkspaceChange, workspaceId])
+  }, [loadTree, workspaceId])
 
   const createWorkspace = React.useCallback(async () => {
     const name = window.prompt('新工作区名称')
@@ -292,8 +299,8 @@ export default function WorkspacePanel({
       setPreview(null)
       setPendingCreate(null)
       setOpenMenuPath(null)
-      onWorkspaceChange?.(nextWorkspaceId)
-      onWorkspaceDeleted?.(data.workspaceId || workspaceId, nextWorkspaceId)
+      onWorkspaceChangeRef.current?.(nextWorkspaceId)
+      onWorkspaceDeletedRef.current?.(data.workspaceId || workspaceId, nextWorkspaceId)
       if (nextWorkspaceId) await loadTree(nextWorkspaceId)
       else setTree(null)
     } catch (err) {
@@ -301,7 +308,7 @@ export default function WorkspacePanel({
     } finally {
       setLoading(false)
     }
-  }, [loadTree, onWorkspaceChange, onWorkspaceDeleted, workspaceId, workspaces])
+  }, [loadTree, workspaceId, workspaces])
 
   const createFolder = React.useCallback(async () => {
     if (!workspaceId) return
